@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/openrundev/openrun/internal/app"
+	"github.com/openrundev/openrun/internal/app/starlark_type"
 	"github.com/openrundev/openrun/internal/plugin"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 	"go.starlark.net/starlark"
@@ -23,6 +25,7 @@ func initOpenRunPlugin(server *Server) {
 		app.CreatePluginApiName(c.ListAllApps, app.READ, "list_all_apps"),
 		app.CreatePluginApiName(c.ListAuditEvents, app.READ, "list_audit_events"),
 		app.CreatePluginApiName(c.ListOperations, app.READ, "list_operations"),
+		app.CreatePluginApiName(c.ListSync, app.READ, "list_sync"),
 	}
 
 	newOpenRunPlugin := func(pluginContext *types.PluginContext) (any, error) {
@@ -108,7 +111,7 @@ func (c *openrunPlugin) listAppsImpl(thread *starlark.Thread, _ *starlark.Builti
 				Path:   appPath,
 			}
 
-			match, err := MatchGlob(path.GoString(), tmpPath)
+			match, err := rbac.MatchGlob(path.GoString(), tmpPath)
 			if err != nil {
 				return nil, err
 			}
@@ -177,6 +180,8 @@ func (c *openrunPlugin) listAppsImpl(thread *starlark.Thread, _ *starlark.Builti
 		v.SetKey(starlark.String("git_sha"), starlark.String(app.GitSha))
 		v.SetKey(starlark.String("git_message"), starlark.String(app.GitMessage))
 		v.SetKey(starlark.String("git_branch"), starlark.String(app.Branch))
+		v.SetKey(starlark.String("update_age"), starlark.String(system.HumanDuration(time.Since(app.UpdateTime))))
+		v.SetKey(starlark.String("update_time"), starlark.String(app.UpdateTime.Format(time.RFC3339)))
 
 		ret.Append(&v)
 	}
@@ -188,37 +193,15 @@ func getSourceUrl(sourceUrl, branch string) string {
 	if branch == "" {
 		return ""
 	}
-	url := sourceUrl
-	if strings.HasPrefix(sourceUrl, "http://") {
-		url = strings.TrimPrefix(sourceUrl, "http://")
-	} else if strings.HasPrefix(sourceUrl, "https://") {
-		url = strings.TrimPrefix(sourceUrl, "https://")
+	if !system.IsGit(sourceUrl) || strings.HasPrefix(sourceUrl, "git@") {
+		return ""
+	}
+	repo, folder, err := parseGitUrl(sourceUrl, false)
+	if err != nil {
+		return ""
 	}
 
-	isGitUrl := false
-	if strings.HasPrefix(url, "github.com/") {
-		url = strings.TrimPrefix(url, "github.com/")
-	} else if strings.HasPrefix(url, "git@github.com:") {
-		url = strings.TrimPrefix(url, "git@github.com:")
-		isGitUrl = true
-	} else {
-		return "" // cannot get full url
-	}
-
-	splitPath := strings.Split(url, "/")
-	if len(splitPath) < 2 {
-		return "" // cannot get full url
-	}
-	folder := ""
-	if len(splitPath) > 2 {
-		folder = strings.Join(splitPath[2:], "/")
-	}
-
-	repo := splitPath[1]
-	if isGitUrl {
-		repo = strings.TrimSuffix(splitPath[1], ".git")
-	}
-	return fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", splitPath[0], repo, branch, folder)
+	return fmt.Sprintf("%s/tree/%s/%s", repo, branch, folder)
 }
 
 func (c *openrunPlugin) ListAuditEvents(thread *starlark.Thread, builtin *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -471,4 +454,23 @@ func getOpList(op string) ([]any, string) {
 		queryParams = append(queryParams, "?")
 	}
 	return opList, strings.Join(queryParams, ",")
+}
+
+func (c *openrunPlugin) ListSync(thread *starlark.Thread, builtin *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	ctx := system.GetRequestContext(thread)
+	sync, err := c.server.ListSyncEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := starlark.List{}
+	for _, entry := range sync.Entries {
+		entryMap, err := starlark_type.ConvertToStarlark(entry)
+		if err != nil {
+			return nil, err
+		}
+		ret.Append(entryMap) //nolint:errcheck
+	}
+
+	return &ret, nil
 }

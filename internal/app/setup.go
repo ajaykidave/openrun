@@ -5,6 +5,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,7 @@ import (
 	"go.starlark.net/starlarkstruct"
 )
 
-func (a *App) loadStarlarkConfig(dryRun types.DryRun) error {
+func (a *App) loadStarlarkConfig(ctx context.Context, dryRun types.DryRun, reloadContainer bool) error {
 	a.Info().Str("path", a.Path).Str("domain", a.Domain).Msg("Loading app")
 
 	buf, err := a.sourceFS.ReadFile(a.getStarPath(apptype.APP_FILE_NAME))
@@ -127,18 +128,19 @@ func (a *App) loadStarlarkConfig(dryRun types.DryRun) error {
 	}
 
 	// Load container config. The proxy config in routes depends on this being loaded first
-	if err = a.loadContainerManager(stripAppPath); err != nil {
+	if err = a.loadContainerManager(ctx, stripAppPath); err != nil {
 		return err
 	}
 
-	if a.containerManager != nil {
-		// Container manager is present, reload the container
+	if a.containerHandler != nil {
+		// Container handler is present, reload the container
 		if a.IsDev {
-			if err = a.containerManager.DevReload(bool(dryRun)); err != nil {
+			if err = a.containerHandler.DevReload(ctx, bool(dryRun)); err != nil {
 				return err
 			}
-		} else {
-			if err := a.containerManager.ProdReload(bool(dryRun)); err != nil {
+		} else if reloadContainer {
+			// In prod mode, reload only when initializing an app
+			if err := a.containerHandler.ProdReload(ctx, bool(dryRun)); err != nil {
 				return err
 			}
 		}
@@ -556,12 +558,12 @@ func (a *App) addAction(count int, val starlark.Value, router *chi.Mux) (err err
 		path = "/" + path
 	}
 	containerProxyUrl := ""
-	if a.containerManager != nil {
-		containerProxyUrl = a.containerManager.GetProxyUrl()
+	if a.containerHandler != nil {
+		containerProxyUrl = a.containerHandler.GetProxyUrl()
 	}
 	action, err := action.NewAction(a.Logger, a.sourceFS, a.IsDev, name, description, path, run, suggest,
 		slices.Collect(maps.Values(a.paramInfo)), a.paramValuesStr, a.paramDict, a.Path, a.appStyle.GetStyleType(),
-		containerProxyUrl, hidden, showValidate, a.auditInsert, a.containerManager, a.jsLibs, a.AppPathDomain(), a.serverConfig, permit, a.authorizer)
+		containerProxyUrl, hidden, showValidate, a.auditInsert, a.containerHandler, a.jsLibs, a.AppPathDomain(), a.serverConfig, permit, a.rbacApi)
 	if err != nil {
 		return fmt.Errorf("error creating action %s: %w", name, err)
 	}
@@ -781,13 +783,14 @@ func (a *App) addProxyConfig(count int, router *chi.Mux, proxyDef *starlarkstruc
 		return rootWildcard, err
 	}
 
+	originalUrlStr := urlStr
 	if urlStr == apptype.CONTAINER_URL {
 		// proxying to container url
-		if a.containerManager == nil {
-			return rootWildcard, fmt.Errorf("container manager not initialized")
+		if a.containerHandler == nil {
+			return rootWildcard, fmt.Errorf("container handler not initialized")
 		}
 
-		urlStr = a.containerManager.GetProxyUrl()
+		urlStr = a.containerHandler.GetProxyUrl()
 	}
 
 	urlParsed, err := url.Parse(urlStr)
@@ -821,7 +824,14 @@ func (a *App) addProxyConfig(count int, router *chi.Mux, proxyDef *starlarkstruc
 		}
 	}
 
-	permsHandler := func(p *httputil.ReverseProxy) http.Handler {
+	var proxyWrapper http.Handler = proxy
+	if originalUrlStr == apptype.CONTAINER_URL {
+		// Wrap the proxy with a tracker to count the bytes sent and received
+		proxyWrapper = NewTracker(proxy, a.AppConfig.Container.IdleShutdownSecs)
+		a.containerHandler.proxyTracker = proxyWrapper.(*Tracker)
+	}
+
+	permsHandler := func(handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// If write API, check if preview/stage app is allowed access
 			isWriteRequest := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete
@@ -845,6 +855,35 @@ func (a *App) addProxyConfig(count int, router *chi.Mux, proxyDef *starlarkstruc
 				r.Header.Set("X-Forwarded-Prefix", a.Path)
 			}
 
+			for key := range r.Header {
+				// Delete all x-openrun- prefixed headers
+				if strings.HasPrefix(strings.ToLower(key), "x-openrun-") {
+					r.Header.Del(key)
+				}
+			}
+
+			// Add X-Openrun- headers to request
+			customPerms := make([]string, 0)
+			if a.rbacApi != nil {
+				customPerms, err = a.rbacApi.GetCustomPermissions(r.Context())
+			}
+			// Add the user and custom permissions to the request headers
+			r.Header.Set(types.OPENRUN_HEADER_PERMS, strings.Join(customPerms, ","))
+
+			// Get user from context, use anonymous user if not set
+			userId := types.ANONYMOUS_USER
+			if userVal := r.Context().Value(types.USER_ID); userVal != nil {
+				if userStr, ok := userVal.(string); ok {
+					userId = userStr
+				}
+			}
+			r.Header.Set(types.OPENRUN_HEADER_USER, userId)
+			appRBACEnabled := false
+			if a.rbacApi != nil {
+				appRBACEnabled = a.rbacApi.IsAppRBACEnabled(r.Context())
+			}
+			r.Header.Set(types.OPENRUN_HEADER_APP_RBAC_ENABLED, strconv.FormatBool(appRBACEnabled))
+
 			// Set the response headers
 			for key, value := range responseHeaders {
 				if value == nil {
@@ -861,13 +900,13 @@ func (a *App) addProxyConfig(count int, router *chi.Mux, proxyDef *starlarkstruc
 			}
 
 			// use the reverse proxy to handle the request
-			p.ServeHTTP(w, r)
+			handler.ServeHTTP(w, r)
 		})
 	}
 	if stripApp {
 		stripPath = path.Join(a.Path, stripPath)
 	}
-	router.Mount(pathStr, http.StripPrefix(stripPath, permsHandler(proxy)))
+	router.Mount(pathStr, http.StripPrefix(stripPath, permsHandler(proxyWrapper)))
 	return rootWildcard, nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/openrundev/openrun/internal/app/appfs"
 	"github.com/openrundev/openrun/internal/app/apptype"
 	"github.com/openrundev/openrun/internal/metadata"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 	"go.starlark.net/starlark"
@@ -198,13 +199,13 @@ func appDefToApplyInfo(appDef *starlarkstruct.Struct) (*types.CreateAppRequest, 
 	}, nil
 }
 
-func (s *Server) setupSource(applyPath, branch, commit, gitAuth string, repoCache *RepoCache) (string, string, error) {
+func (s *Server) setupSource(applyPath, branch, commit, gitAuth string, repoCache *RepoCache, isDev bool) (string, string, error) {
 	if !system.IsGit(applyPath) {
 		return filepath.Dir(applyPath), filepath.Base(applyPath), nil
 	}
 
 	branch = cmp.Or(branch, "main")
-	repo, applyFile, _, _, err := repoCache.CheckoutRepo(applyPath, branch, commit, gitAuth, false)
+	repo, applyFile, _, _, err := repoCache.CheckoutRepo(applyPath, branch, commit, gitAuth, isDev)
 	if err != nil {
 		return "", "", err
 	}
@@ -220,7 +221,7 @@ func (s *Server) setupSource(applyPath, branch, commit, gitAuth string, repoCach
 
 func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath string, appPathGlob string, approve, dryRun, promote bool,
 	reload types.AppReloadOption, branch, commit, gitAuth string, clobber,
-	forceReload bool, lastRunCommitId string, repoCache *RepoCache, dev bool) (*types.AppApplyResponse, []types.AppPathDomain, error) {
+	forceReload bool, lastRunCommitId string, repoCache *RepoCache, isDev bool) (*types.AppApplyResponse, []types.AppPathDomain, error) {
 	var tx types.Transaction
 	var err error
 	if inputTx.Tx == nil {
@@ -253,7 +254,8 @@ func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath
 		if err != nil {
 			return nil, nil, fmt.Errorf("error getting git commit sha for %s: %w", applyPath, err)
 		}
-		if !forceReload && lastRunCommitId != "" && newSha == lastRunCommitId && (commit == "" || commit == lastRunCommitId) {
+		if !forceReload && (reload != types.AppReloadOptionMatched) &&
+			lastRunCommitId != "" && newSha == lastRunCommitId && (commit == "" || commit == lastRunCommitId) {
 			// If no commit is specified, and the current version is the same as the latest commit, skip apply
 			// Only schedule sync passes in the lastRunCommitId, so this does not happen for normal apply
 			s.Debug().Msgf("Already applied commit for %s, skipping apply", applyPath)
@@ -265,7 +267,7 @@ func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath
 		}
 	}
 
-	dir, file, err := s.setupSource(applyPath, branch, commit, gitAuth, repoCache)
+	dir, file, err := s.setupSource(applyPath, branch, commit, gitAuth, repoCache, isDev)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -294,7 +296,7 @@ func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath
 			return nil, nil, fmt.Errorf("error reading file %s: %w", f, err)
 		}
 
-		fileConfig, err := s.loadApplyInfo(f, fileBytes, branch, dev)
+		fileConfig, err := s.loadApplyInfo(f, fileBytes, branch, isDev)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -320,7 +322,7 @@ func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath
 
 	filteredApps := make([]types.AppPathDomain, 0, len(applyConfig))
 	for appPathDomain := range applyConfig {
-		match, err := MatchGlob(appPathGlob, appPathDomain)
+		match, err := rbac.MatchGlob(appPathGlob, appPathDomain)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -370,8 +372,8 @@ func (s *Server) Apply(ctx context.Context, inputTx types.Transaction, applyPath
 	for _, newApp := range newApps {
 		s.Trace().Msgf("Applying create app %s", newApp)
 		applyInfo := applyConfig[newApp]
-		if dev {
-			applyInfo.IsDev = dev // Override the dev status from the apply command cli
+		if isDev {
+			applyInfo.IsDev = isDev // Override the dev status from the apply command cli
 		}
 		res, err := s.CreateAppTx(ctx, tx, newApp.String(), approve, dryRun, applyInfo, repoCache)
 		if err != nil {
@@ -495,16 +497,16 @@ func (s *Server) applyAppUpdate(ctx context.Context, tx types.Transaction, appPa
 
 	authChanged := checkPropertyChanged(oldInfo, func(info *types.CreateAppRequest) any {
 		return info.AppAuthn
-	}, newInfo.AppAuthn, liveApp.Settings.AuthnType, clobber)
+	}, newInfo.AppAuthn, liveApp.Metadata.AuthnType, clobber)
 	if authChanged {
-		return nil, fmt.Errorf("app %s authentication changed, cannot apply changes. Use \"app update-settings\"", appPathDomain)
+		liveApp.Metadata.AuthnType = newInfo.AppAuthn
 	}
 
 	gitAuthChanged := checkPropertyChanged(oldInfo, func(info *types.CreateAppRequest) any {
 		return info.GitAuthName
-	}, newInfo.GitAuthName, liveApp.Settings.GitAuthName, clobber)
+	}, newInfo.GitAuthName, liveApp.Metadata.GitAuthName, clobber)
 	if gitAuthChanged {
-		return nil, fmt.Errorf("app %s git auth changed, cannot apply changes. Use \"app update-settings\"", appPathDomain)
+		liveApp.Metadata.GitAuthName = newInfo.GitAuthName
 	}
 
 	specChanged := checkPropertyChanged(oldInfo, func(info *types.CreateAppRequest) any {
@@ -571,7 +573,7 @@ func (s *Server) applyAppUpdate(ctx context.Context, tx types.Transaction, appPa
 	appConfigChanged := mergeMap(oldAppConfig, newInfo.AppConfig, liveApp.Metadata.AppConfig, clobber)
 
 	updated := specChanged || gitBranchChanged || gitCommitChanged || paramsChanged ||
-		contConfigChanged || contArgsChanged || contVolsChanged || appConfigChanged
+		contConfigChanged || contArgsChanged || contVolsChanged || appConfigChanged || authChanged || gitAuthChanged
 	updatedApps := make([]types.AppPathDomain, 0)
 	if updated {
 		liveApp.Metadata.VersionMetadata.ApplyInfo, err = json.Marshal(newInfo)

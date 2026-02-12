@@ -26,6 +26,7 @@ import (
 	"github.com/openrundev/openrun/internal/app/appfs"
 	"github.com/openrundev/openrun/internal/app/apptype"
 	"github.com/openrundev/openrun/internal/app/starlark_type"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 	"go.starlark.net/starlark"
@@ -68,12 +69,12 @@ type Action struct {
 	Links             []ActionLink    // links to other actions
 	showValidate      bool
 	auditInsert       func(*types.AuditEvent) error
-	containerManager  any // Container manager, if available, used to run commands in the container
+	containerHandler  any // Container manager, if available, used to run commands in the container
 	esmLibs           []types.JSLibrary
 	appPathDomain     types.AppPathDomain
 	serverConfig      *types.ServerConfig
 	permit            []string
-	authorizer        types.AuthorizerFunc // can be null
+	rbacApi           rbac.RBACAPI
 }
 
 // NewAction creates a new action
@@ -81,7 +82,7 @@ func NewAction(logger *types.Logger, sourceFS *appfs.SourceFs, isDev bool, name,
 	params []apptype.AppParam, paramValuesStr map[string]string, paramDict starlark.StringDict,
 	appPath string, styleType types.StyleType, containerProxyUrl string, hidden []string, showValidate bool,
 	auditInsert func(*types.AuditEvent) error, containerManager any, jsLibs []types.JSLibrary, appPathDomain types.AppPathDomain,
-	serverConfig *types.ServerConfig, permit []string, authorizer types.AuthorizerFunc) (*Action, error) {
+	serverConfig *types.ServerConfig, permit []string, rbacApi rbac.RBACAPI) (*Action, error) {
 
 	funcMap := system.GetFuncMap()
 
@@ -152,13 +153,13 @@ func NewAction(logger *types.Logger, sourceFS *appfs.SourceFs, isDev bool, name,
 		hidden:            hiddenParams,
 		showValidate:      showValidate,
 		auditInsert:       auditInsert,
-		containerManager:  containerManager,
+		containerHandler:  containerManager,
 		esmLibs:           esmLibs,
 		// Links, AppTemplate and Theme names are initialized later
 		appPathDomain: appPathDomain,
 		serverConfig:  serverConfig,
 		permit:        permit,
-		authorizer:    authorizer,
+		rbacApi:       rbacApi,
 	}, nil
 }
 
@@ -213,8 +214,8 @@ func (a *Action) validateAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Action) authorizeAction(w http.ResponseWriter, r *http.Request) bool {
-	if a.authorizer != nil && len(a.permit) > 0 {
-		authorized, err := a.authorizer(r.Context(), a.permit)
+	if a.rbacApi != nil && len(a.permit) > 0 {
+		authorized, err := a.rbacApi.AuthorizeAny(r.Context(), a.permit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return false
@@ -288,8 +289,8 @@ func (a *Action) execAction(w http.ResponseWriter, r *http.Request, isSuggest, i
 	if a.containerProxyUrl != "" {
 		thread.SetLocal(types.TL_CONTAINER_URL, a.containerProxyUrl)
 	}
-	if a.containerManager != nil {
-		thread.SetLocal(types.TL_CONTAINER_MANAGER, a.containerManager)
+	if a.containerHandler != nil {
+		thread.SetLocal(types.TL_CONTAINER_HANDLER, a.containerHandler)
 	}
 	thread.SetLocal(types.TL_APP_URL, types.GetAppUrl(a.appPathDomain, a.serverConfig))
 	isHtmxRequest := r.Header.Get("HX-Request") == "true"
@@ -872,9 +873,9 @@ func (a *Action) getLinksWithQS(ctx context.Context, qs string) []ActionLink {
 	linksWithQS := make([]ActionLink, 0, len(a.Links))
 	for _, link := range a.Links {
 		authorized := true
-		if a.authorizer != nil && len(link.Permits) > 0 {
+		if a.rbacApi != nil && len(link.Permits) > 0 {
 			var err error
-			authorized, err = a.authorizer(ctx, link.Permits)
+			authorized, err = a.rbacApi.AuthorizeAny(ctx, link.Permits)
 			if err != nil {
 				a.Error().Msgf("error authorizing link %s: %s", link.Name, err)
 			}

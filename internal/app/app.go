@@ -5,6 +5,7 @@ package app
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"github.com/openrundev/openrun/internal/app/apptype"
 	"github.com/openrundev/openrun/internal/app/dev"
 	"github.com/openrundev/openrun/internal/app/starlark_type"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 	"go.starlark.net/starlark"
@@ -58,7 +60,7 @@ type App struct {
 	paramValuesStr   map[string]string   // the param values for the app, from metadata and defaults
 	paramDict        starlark.StringDict // the Starlark param values for the app
 	plugins          *AppPlugins
-	containerManager *ContainerManager
+	containerHandler *ContainerHandler
 	serverConfig     *types.ServerConfig
 
 	globals      starlark.StringDict    // global variables defined in starlark code
@@ -87,8 +89,8 @@ type App struct {
 	lastRequestTime atomic.Int64
 	secretEvalFunc  func([][]string, string, string) (string, error)
 	auditInsert     func(*types.AuditEvent) error
-	AppRunPath      string               // path to the app run directory
-	authorizer      types.AuthorizerFunc // the authorizer function to use, can be null
+	AppRunPath      string       // path to the app run directory
+	rbacApi         rbac.RBACAPI // the rbac api to use
 }
 
 type starlarkCacheEntry struct {
@@ -105,7 +107,8 @@ func NewApp(sourceFS *appfs.SourceFs, workFS *appfs.WorkFs, logger *types.Logger
 	appEntry *types.AppEntry, systemConfig *types.SystemConfig,
 	plugins map[string]types.PluginSettings, appConfig types.AppConfig, notifyClose chan<- types.AppPathDomain,
 	secretEvalFunc func([][]string, string, string) (string, error),
-	auditInsert func(*types.AuditEvent) error, serverConfig *types.ServerConfig, authorizer types.AuthorizerFunc) (*App, error) {
+	auditInsert func(*types.AuditEvent) error, serverConfig *types.ServerConfig,
+	rbacApi rbac.RBACAPI) (*App, error) {
 	newApp := &App{
 		sourceFS:       sourceFS,
 		Logger:         logger,
@@ -117,7 +120,7 @@ func NewApp(sourceFS *appfs.SourceFs, workFS *appfs.WorkFs, logger *types.Logger
 		appStyle:       &dev.AppStyle{},
 		auditInsert:    auditInsert,
 		serverConfig:   serverConfig,
-		authorizer:     authorizer,
+		rbacApi:        rbacApi,
 	}
 	newApp.plugins = NewAppPlugins(newApp, plugins, appEntry.Metadata.Accounts)
 	newApp.AppConfig = appConfig
@@ -154,10 +157,10 @@ func NewApp(sourceFS *appfs.SourceFs, workFS *appfs.WorkFs, logger *types.Logger
 	return newApp, nil
 }
 
-func (a *App) Initialize(dryRun types.DryRun) error {
+func (a *App) Initialize(ctx context.Context, dryRun types.DryRun) error {
 	var reloaded bool
 	var err error
-	if reloaded, err = a.Reload(false, true, dryRun); err != nil {
+	if reloaded, err = a.Reload(ctx, false, true, dryRun, true); err != nil {
 		return err
 	}
 
@@ -183,8 +186,8 @@ func (a *App) Close() error {
 		_ = a.appDev.Close()
 	}
 
-	if a.containerManager != nil {
-		if err := a.containerManager.Close(); err != nil {
+	if a.containerHandler != nil {
+		if err := a.containerHandler.Close(); err != nil {
 			return err
 		}
 	}
@@ -196,7 +199,7 @@ func (a *App) ResetFS() {
 	a.sourceFS.Reset()
 }
 
-func (a *App) Reload(force, immediate bool, dryRun types.DryRun) (bool, error) {
+func (a *App) Reload(ctx context.Context, force, immediate bool, dryRun types.DryRun, reloadContainer bool) (bool, error) {
 	requestTime := time.Now()
 
 	a.initMutex.Lock()
@@ -262,8 +265,8 @@ func (a *App) Reload(force, immediate bool, dryRun types.DryRun) (bool, error) {
 	}
 
 	// Load Starlark config, AppConfig is updated with the settings contents
-	if err = a.loadStarlarkConfig(dryRun); err != nil {
-		return false, fmt.Errorf("error loading starlark config: %w", err)
+	if err = a.loadStarlarkConfig(ctx, dryRun, reloadContainer); err != nil {
+		return false, fmt.Errorf("error during initial setup: %w", err)
 	}
 	a.Metadata.Name = a.Name
 
@@ -376,7 +379,7 @@ const (
 	DOCKERFILE    = "Dockerfile"
 )
 
-func (a *App) loadContainerManager(stripAppPath bool) error {
+func (a *App) loadContainerManager(ctx context.Context, stripAppPath bool) error {
 	containerConfig, err := a.appDef.Attr("container")
 	if err != nil || containerConfig == starlark.None {
 		// Plugin not authorized, skip any container files
@@ -498,18 +501,18 @@ func (a *App) loadContainerManager(stripAppPath bool) error {
 		return fmt.Errorf("no container file found, source is set to %s", src)
 	}
 
-	if a.containerManager != nil {
-		if err := a.containerManager.Close(); err != nil {
+	if a.containerHandler != nil {
+		if err := a.containerHandler.Close(); err != nil {
 			return fmt.Errorf("error shutting down previous container manager: %w", err)
 		}
 	}
 
-	a.containerManager, err = NewContainerManager(a.Logger, a,
-		fileName, a.systemConfig, port, lifetime, scheme, health, buildDir,
+	a.containerHandler, err = NewContainerHandler(a.Logger, a,
+		fileName, a.serverConfig, port, lifetime, scheme, health, buildDir,
 		a.sourceFS, a.paramValuesStr, a.AppConfig.Container, stripAppPath, volumes,
 		a.getSecretsAllowed("container.in", "config"), cargs)
 	if err != nil {
-		return fmt.Errorf("error creating container manager: %w", err)
+		return fmt.Errorf("error creating container handler: %w", err)
 	}
 
 	return nil
@@ -705,7 +708,7 @@ func (a *App) startWatcher() error {
 
 					inReload.Store(true)
 					defer inReload.Store(false)
-					_, err := a.Reload(true, false, types.DryRun(false))
+					_, err := a.Reload(context.Background(), true, false, types.DryRun(false), true)
 					a.reloadError = err
 					if err != nil {
 						a.Error().Err(err).Msg("Error reloading app")

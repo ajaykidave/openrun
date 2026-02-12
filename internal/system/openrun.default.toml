@@ -61,13 +61,14 @@ tailwindcss_command = "tailwindcss"
 file_watcher_debounce_millis = 300
 watch_ignore_patterns = ["**/.vscode/**", "**/.idea/**", "**/.git/**", "**/.DS_Store/**", "**/.*sw*"] # patterns to ignore for file watcher
 node_path = ""                      # node module lookup paths https://esbuild.github.io/api/#node-paths
-container_command = "auto"          # "auto" or "docker" or "podman"
+container_command = "auto"          # "auto" or "docker" or "podman" or "kubernetes"
 default_domain = "localhost"        # default domain for apps
 root_serve_list_apps = "auto"       # "auto" means serve list_apps app for default domain, "disable" means don't server for any domain,
                                     # any other value means serve for specified domain
 enable_compression = false          # enable compression for HTTP responses
 default_schedule_mins = 15          # default sync schedule interval in minutes
 max_sync_failure_count = 5          # max number of sync failures before sync is marked as disabled
+early_hints = false                 # enable early hints for HTML responses
 
 http_event_retention_days = 90      # number of days to retain http events
 non_http_event_retention_days = 180 # number of days to retain non-http (system, action, custom) events
@@ -75,6 +76,14 @@ allowed_env = ["HOME", "OPENRUN_HOME", "PATH"] # env values allowed for use in n
 
 max_concurrent_builds = 1 # max number of concurrent container builds
 max_build_wait_secs = 120 # max wait time for a build lock
+
+[kubernetes]
+namespace = "openrun"
+use_node_port = false
+
+[builder]
+mode = "auto" # "auto" or "kaniko" or "command" or "delegate:<url>"
+kaniko_image = "ghcr.io/kaniko-build/dist/chainguard-dev-kaniko/executor:v1.25.3-slim"
 
 [plugin."store.in"]
 db_connection = "sqlite:$OPENRUN_HOME/metadata/clace_app_store.db"
@@ -84,7 +93,7 @@ db_connection = "sqlite:$OPENRUN_HOME/metadata/clace_fs.db"
 
 [app_config]
 # app config can be set at the app level using a metadata config update. For example:
-#  openrun app update-metadata conf --promote 'cors.allow_methods="GET, POST"' /myapp
+#  openrun app update conf --promote 'cors.allow_methods="GET, POST"' /myapp
 
 # ==== CORS related Config ====
 # Default setting is to add CORS headers with * as allow_origin header. If cors.allow_origin is set to empty string,
@@ -106,10 +115,21 @@ container.health_timeout_secs = 5
 # Idle Shutdown Config
 container.idle_shutdown_secs = 180
 container.idle_shutdown_dev_apps = false
+container.idle_bytes_high_watermark = 1500 # bytes high watermark for idle shutdown 
+                                           # (1500 bytes sent and recv over 180 seconds)
 
 # Status check Config
-container.status_check_interval_secs = 5
-container.status_health_attempts = 3
+container.status_check_interval_secs = 20
+container.status_health_attempts = 10
+
+# Show logs for container startup failures in prod mode (dev is always true)
+container.log_lines_to_show = 1000
+container.show_logs_for_failure = true
+
+# Kubernetes related settings
+kubernetes.default_volume_size = "10Gi"
+kubernetes.strict_version_check = true
+kubernetes.scaling_threshold_cpu = 80
 
 # Proxy related settings
 proxy.max_idle_conns = 250
@@ -124,3 +144,4 @@ audit.redact_url = false
 audit.skip_http_events = false
 
 security.default_secrets_provider = "env" # default secret provider, env if it is enabled
+security.disable_csrf_protection = false # disable CSRF protection for apps

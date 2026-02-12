@@ -5,6 +5,7 @@ package passwd
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"math/big"
 )
 
@@ -32,4 +33,25 @@ func generateRandString(length int, charsAllowed string) (string, error) {
 // GeneratePassword generates a random password
 func GeneratePassword() (string, error) {
 	return generateRandString(16, PASSWORD_CHARS)
+}
+
+func GenerateSessionNonce() (string, string, error) {
+	session, err := GenerateRandomKey(24)
+	if err != nil {
+		return "", "", err
+	}
+	nonce, err := GenerateRandomKey(32)
+	if err != nil {
+		return "", "", err
+	}
+	return base64.URLEncoding.EncodeToString(session), base64.URLEncoding.EncodeToString(nonce), nil
+}
+
+func GenerateRandomKey(length int) ([]byte, error) {
+	key := make([]byte, length)
+	_, err := rand.Read(key)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
 }

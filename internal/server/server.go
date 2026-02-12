@@ -26,8 +26,10 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/go-chi/chi/middleware"
 	"github.com/openrundev/openrun/internal/app"
+	"github.com/openrundev/openrun/internal/container"
 	"github.com/openrundev/openrun/internal/metadata"
 	"github.com/openrundev/openrun/internal/passwd"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/server/list_apps"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
@@ -129,7 +131,8 @@ type Server struct {
 	handler        *Handler
 	apps           *AppStore
 	authHandler    *AdminBasicAuth
-	ssoAuth        *SSOAuth
+	oAuthManager   *OAuthManager
+	samlManager    *SAMLManager
 	notifyClose    chan types.AppPathDomain
 	secretsManager *system.SecretManager
 	listAppsApp    *app.App
@@ -139,7 +142,8 @@ type Server struct {
 	syncTimer      *time.Ticker
 	configMu       sync.RWMutex
 	dynamicConfig  *types.DynamicConfig
-	rbacManager    *RBACManager
+	rbacManager    *rbac.RBACManager
+	csrfMiddleware *http.CrossOriginProtection
 }
 
 // NewServer creates a new instance of the OpenRun Server
@@ -150,15 +154,30 @@ func NewServer(config *types.ServerConfig) (*Server, error) {
 	}
 
 	l := types.NewLogger(&config.Log)
+	l.Info().Str("version", types.GetVersion()).Str("commit", types.GetCommit()).Msg("Initializing server")
+
+	// Setup secrets manager
+	secretsManager, err := system.NewSecretManager(context.Background(), config.Secret, config.AppConfig.Security.DefaultSecretsProvider, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update secrets in the config
+	err = updateConfigSecrets(config, secretsManager.EvalTemplate)
+	if err != nil {
+		return nil, err
+	}
+
 	db, err := metadata.NewMetadata(l, config)
 	if err != nil {
 		return nil, err
 	}
 
 	server := &Server{
-		Logger: l,
-		config: config,
-		db:     db,
+		Logger:         l,
+		config:         config,
+		db:             db,
+		secretsManager: secretsManager,
 	}
 	db.AppNotifyFunc = server.appNotifyHandler
 	db.ConfigNotifyFunc = server.configNotifyHandler
@@ -166,21 +185,34 @@ func NewServer(config *types.ServerConfig) (*Server, error) {
 	server.authHandler = NewAdminBasicAuth(l, config)
 	server.notifyClose = make(chan types.AppPathDomain)
 
-	// Setup secrets manager
-	server.secretsManager, err = system.NewSecretManager(context.Background(), config.Secret, config.AppConfig.Security.DefaultSecretsProvider)
-	if err != nil {
+	csrfMiddleware := http.NewCrossOriginProtection()
+	csrfMiddleware.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Cross origin check failed - CSRF protection", http.StatusForbidden)
+	}))
+	server.csrfMiddleware = csrfMiddleware
+
+	// Setup OAuth auth
+	server.oAuthManager = NewOAuthManager(l, config, db)
+	var newSessionSecret, newSessionBlockKey []byte
+	if newSessionSecret, err = passwd.GenerateRandomKey(32); err != nil {
+		return nil, err
+	}
+	if newSessionBlockKey, err = passwd.GenerateRandomKey(32); err != nil {
+		return nil, err
+	}
+	if newSessionSecret, err = server.KVInitConstant(context.Background(), types.COOKIE_SESSION_SECRET_KV, newSessionSecret); err != nil {
+		return nil, err
+	}
+	if newSessionBlockKey, err = server.KVInitConstant(context.Background(), types.COOKIE_SESSION_BLOCK_KEY_KV, newSessionBlockKey); err != nil {
+		return nil, err
+	}
+	if err = server.oAuthManager.Setup(newSessionSecret, newSessionBlockKey); err != nil {
 		return nil, err
 	}
 
-	// Update secrets in the config
-	err = updateConfigSecrets(server.config, server.secretsManager.EvalTemplate)
-	if err != nil {
-		return nil, err
-	}
-
-	// Setup SSO auth
-	server.ssoAuth = NewSSOAuth(l, config)
-	if err = server.ssoAuth.Setup(); err != nil {
+	// Setup SAML auth
+	server.samlManager = NewSAMLManager(l, config, server.oAuthManager.cookieStore, db)
+	if err = server.samlManager.Setup(context.Background()); err != nil {
 		return nil, err
 	}
 
@@ -200,13 +232,15 @@ func NewServer(config *types.ServerConfig) (*Server, error) {
 	}
 
 	if config.System.ContainerCommand == "auto" {
-		config.System.ContainerCommand = server.lookupContainerCommand()
+		config.System.ContainerCommand = container.LookupContainerCommand(true)
 		// if command is empty string, that means either containers are disabled in config or no container command found
 	}
+
 	server.Trace().Str("cmd", config.System.ContainerCommand).Msg("Container management command")
 	go server.handleAppClose()
 
 	initOpenRunPlugin(server)
+	initAdminPlugin(server)
 
 	server.dynamicConfig, err = server.db.GetConfig()
 	if err != nil && !errors.Is(err, metadata.ErrConfigNotFound) {
@@ -241,7 +275,7 @@ func NewServer(config *types.ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("error saving dynamic config: %w", err)
 	}
 
-	server.rbacManager, err = NewRBACHandler(l, &server.dynamicConfig.RBAC, config)
+	server.rbacManager, err = rbac.NewRBACHandler(l, &server.dynamicConfig.RBAC, config)
 	if err != nil {
 		return nil, fmt.Errorf("error initializing rbac manager: %w", err)
 	}
@@ -351,6 +385,16 @@ func (s *Server) configNotifyHandler(updatePayload types.ConfigUpdatePayload) {
 // updateConfigSecrets updates the secrets in the server config using the evalSecret function
 func updateConfigSecrets(config *types.ServerConfig, evalSecret func(string) (string, error)) error {
 	var err error
+	config.Metadata.DBConnection, err = evalSecret(config.Metadata.DBConnection)
+	if err != nil {
+		return err
+	}
+	config.Metadata.AuditDBConnection, err = evalSecret(config.Metadata.AuditDBConnection)
+	if err != nil {
+		return err
+	}
+	// TODO : eval store and fs db connections secrets
+
 	for name, auth := range config.Auth {
 		if auth.Key, err = evalSecret(auth.Key); err != nil {
 			return err
@@ -395,11 +439,6 @@ func updateConfigSecrets(config *types.ServerConfig, evalSecret func(string) (st
 	return nil
 }
 
-const (
-	DOCKER_COMMAND = "docker"
-	PODMAN_COMMAND = "podman"
-)
-
 // handleAppClose listens for app close notifications and removes the app from the store
 func (s *Server) handleAppClose() {
 	for appPathDomain := range s.notifyClose {
@@ -407,18 +446,6 @@ func (s *Server) handleAppClose() {
 		s.Debug().Str("app", appPathDomain.String()).Msg("App closed")
 	}
 	s.Debug().Msg("App close handler stopped")
-}
-
-func (s *Server) lookupContainerCommand() string {
-	podmanExec := system.FindExec(PODMAN_COMMAND)
-	if podmanExec != "" {
-		return podmanExec
-	}
-	dockerExec := system.FindExec(DOCKER_COMMAND)
-	if dockerExec != "" {
-		return dockerExec
-	}
-	return ""
 }
 
 // setupAdminAccount sets up the basic auth password for admin account. If admin user is unset,
@@ -612,7 +639,9 @@ func (s *Server) setupHTTPSServer() (*http.Server, error) {
 		}
 	}
 
-	s.Info().Msgf("mkcert path %s", mkcertPath)
+	if mkcertPath != "" {
+		s.Info().Msgf("mkcert path %s", mkcertPath)
+	}
 	var mkcertsLock sync.Mutex
 	if err := os.MkdirAll(os.ExpandEnv(s.config.Https.CertLocation), 0700); err != nil {
 		return nil, fmt.Errorf("error creating cert directory %s : %s",
@@ -628,9 +657,7 @@ func (s *Server) setupHTTPSServer() (*http.Server, error) {
 		certmagic.DefaultACME.Agreed = true
 		certmagic.DefaultACME.Email = s.config.Https.ServiceEmail
 		certmagic.DefaultACME.DisableHTTPChallenge = true
-		// Customize the storage directory
-		customStorageDir := os.ExpandEnv(s.config.Https.StorageLocation)
-		certmagic.Default.Storage = &certmagic.FileStorage{Path: customStorageDir}
+		certmagic.Default.Storage = s.db.GetCertStorage() // Use the database backed storage
 
 		magicConfig := certmagic.NewDefault()
 		magicConfig.OnDemand = &certmagic.OnDemandConfig{
@@ -727,12 +754,17 @@ func (s *Server) setupHTTPSServer() (*http.Server, error) {
 		}
 	}
 
+	// Create a rate-limited error logger for TLS handshake errors
+	rateLimitedWriter := NewRateLimitedErrorLogger(os.Stderr)
+	errorLog := log.New(rateLimitedWriter, "", log.LstdFlags)
+
 	server := &http.Server{
 		WriteTimeout: 180 * time.Second,
 		ReadTimeout:  180 * time.Second,
 		IdleTimeout:  30 * time.Second,
 		Handler:      s.handler.router,
 		TLSConfig:    tlsConfig,
+		ErrorLog:     errorLog,
 	}
 	return server, nil
 }
@@ -769,7 +801,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	return cmp.Or(err1, err2, err3)
 }
 
-func (s *Server) GetListAppsApp() (*app.App, error) {
+func (s *Server) GetListAppsApp(ctx context.Context) (*app.App, error) {
 	s.mu.RLock()
 	if s.listAppsApp != nil {
 		s.mu.RUnlock()
@@ -802,12 +834,11 @@ func (s *Server) GetListAppsApp() (*app.App, error) {
 		Domain:    s.config.System.DefaultDomain,
 		SourceUrl: "-",
 		UserID:    "admin",
-		Settings: types.AppSettings{
-			AuthnType: authnType,
-		},
+		Settings:  types.AppSettings{},
 		Metadata: types.AppMetadata{
-			Name:  "List Apps",
-			Loads: []string{"openrun.in"},
+			Name:      "List Apps",
+			AuthnType: authnType,
+			Loads:     []string{"openrun.in"},
 			Permissions: []types.Permission{
 				{Plugin: "openrun.in", Method: "list_apps"},
 			},
@@ -818,12 +849,12 @@ func (s *Server) GetListAppsApp() (*app.App, error) {
 	appLogger := types.Logger{Logger: &subLogger}
 	s.listAppsApp, err = app.NewApp(sourceFS, nil, &appLogger, &appEntry, &s.config.System,
 		s.config.Plugins, s.config.AppConfig, s.notifyClose, s.secretsManager.AppEvalTemplate,
-		s.InsertAuditEvent, s.config, s.AuthorizeAny)
+		s.InsertAuditEvent, s.config, s.rbacManager)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = s.listAppsApp.Reload(true, true, false)
+	_, err = s.listAppsApp.Reload(ctx, true, true, types.DryRunFalse, true)
 	if err != nil {
 		return nil, err
 	}
@@ -837,7 +868,7 @@ func (s *Server) ParseGlob(appGlob string) ([]types.AppInfo, error) {
 		return nil, err
 	}
 
-	matched, err := ParseGlobFromInfo(appGlob, appsInfo)
+	matched, err := rbac.ParseGlobFromInfo(appGlob, appsInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -845,38 +876,14 @@ func (s *Server) ParseGlob(appGlob string) ([]types.AppInfo, error) {
 	return matched, nil
 }
 
-// AuthorizeAny checks if the user has access to any of the specified permissions
-// Used for app level permissions, like actions access
-func (s *Server) AuthorizeAny(ctx context.Context, permissions []string) (bool, error) {
-	for _, permission := range permissions {
-		authorized, err := s.Authorize(ctx, types.RBACPermission(permission), true)
-		if err != nil {
-			return false, err
-		}
-		if authorized {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// Authorize checks if the user has access to the specified permission
-func (s *Server) Authorize(ctx context.Context, permission types.RBACPermission, isAppLevelPermission bool) (bool, error) {
-	userId := ctx.Value(types.USER_ID).(string)
-	groups := ctx.Value(types.GROUPS).([]string)
-	appPathDomain := ctx.Value(types.APP_PATH_DOMAIN).(types.AppPathDomain)
-	appAuth := string(ctx.Value(types.APP_AUTH).(types.AppAuthnType))
-	return s.rbacManager.Authorize(userId, appPathDomain, appAuth, permission, groups, isAppLevelPermission)
-}
-
 // AuthorizeList checks if the user has access to perform list operation on the specified app
 // For RBAC mode, uses RBAC permissions. For non-RBAC mode, look at whether app is using
 // same authentication types as used by the caller
 func (s *Server) AuthorizeList(userId string, app *types.AppInfo, groups []string) (bool, error) {
 	appAuthStr := string(app.Auth)
-	if s.rbacManager.rbacConfig.Enabled {
+	if s.rbacManager.RbacConfig.Enabled {
 		// RBAC auth is enabled, verify access
-		return s.rbacManager.Authorize(userId, app.AppPathDomain, appAuthStr, types.PermissionList, groups, false)
+		return s.rbacManager.AuthorizeInt(userId, app.AppPathDomain, appAuthStr, types.PermissionList, groups, false)
 	}
 
 	if userId != "" && userId == types.ADMIN_USER {
@@ -884,7 +891,7 @@ func (s *Server) AuthorizeList(userId string, app *types.AppInfo, groups []strin
 		return true, nil
 	}
 
-	appAuthStr = strings.TrimPrefix(appAuthStr, RBAC_AUTH_PREFIX)
+	appAuthStr = strings.TrimPrefix(appAuthStr, rbac.RBAC_AUTH_PREFIX)
 	appAuth := types.AppAuthnType(appAuthStr)
 	if appAuth == types.AppAuthnDefault {
 		appAuth = types.AppAuthnType(s.config.Security.AppDefaultAuthType)
@@ -907,4 +914,39 @@ func (s *Server) AuthorizeList(userId string, app *types.AppInfo, groups []strin
 		// Check Oauth provider is the same as the app's provider
 		return provider == string(appAuth), nil
 	}
+}
+
+// KVInitConstant initializes a constant value in the DB. If the value already exists, it returns the existing value.
+// If the value does not exist, it inserts the new value and returns it. If another server inserts the value concurrently,
+// it fetches the value from the DB and returns it.
+func (s *Server) KVInitConstant(ctx context.Context, keyName string, newValue []byte) ([]byte, error) {
+	keyName = types.CONSTANT_KV_PREFIX + keyName
+	dbValue, err := s.db.FetchKVBlob(ctx, keyName)
+	if err == nil {
+		// Value already exists in DB, use it
+		return dbValue, nil
+	}
+	err = s.db.StoreKVBlob(ctx, keyName, newValue, nil)
+	if err == nil {
+		// New value inserted, return it
+		return newValue, nil
+	}
+
+	// Failed to insert, maybe concurrent insert from another server, get the value from the DB
+	dbValue, err = s.db.FetchKVBlob(ctx, keyName)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching constant value: %w", err)
+	}
+	return dbValue, nil
+}
+
+// KVStore is an interface for a key-value store. Implemented by metadata.Metadata
+type KVStore interface {
+	FetchKV(ctx context.Context, key string) (map[string]any, error)
+	StoreKV(ctx context.Context, key string, value map[string]any, expireAt *time.Time) error
+	StoreKVBlob(ctx context.Context, key string, value []byte, expireAt *time.Time) error
+
+	UpdateKV(ctx context.Context, key string, value map[string]any) error
+	UpdateKVBlob(ctx context.Context, key string, value []byte) error
+	DeleteKV(ctx context.Context, key string) error
 }

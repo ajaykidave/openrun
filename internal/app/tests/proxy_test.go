@@ -4,6 +4,7 @@
 package app_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,26 @@ import (
 	"github.com/openrundev/openrun/internal/types"
 )
 
+// testRBAC is a minimal RBACAPI implementation for tests
+type testRBAC struct {
+	perms []string
+}
+
+func (t *testRBAC) AuthorizeAny(ctx context.Context, permissions []string) (bool, error) {
+	return true, nil
+}
+
+func (t *testRBAC) Authorize(ctx context.Context, permission types.RBACPermission, isAppLevelPermission bool) (bool, error) {
+	return true, nil
+}
+
+func (t *testRBAC) GetCustomPermissions(ctx context.Context) ([]string, error) {
+	return t.perms, nil
+}
+
+func (t *testRBAC) IsAppRBACEnabled(ctx context.Context) bool {
+	return true
+}
 func TestProxyBasics(t *testing.T) {
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/abc" {
@@ -652,4 +673,98 @@ permissions=[
 	testutil.AssertEqualsString(t, "header", "ALLOWED", response.Header().Get("ALLOW"))
 	testutil.AssertEqualsString(t, "header", "NEWVAL", response.Header().Get("NEWH"))
 	testutil.AssertEqualsString(t, "header", "aa/abc/defbb", response.Header().Get("NEWTEMP"))
+}
+
+func TestProxyUserAndPermsHeaders(t *testing.T) {
+	// Test that X-Openrun-User and X-Openrun-Perms headers are passed to proxied endpoint
+	var receivedUser string
+	var receivedPerms string
+	var receivedRBACEnabled string
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUser = r.Header.Get("X-Openrun-User")
+		receivedPerms = r.Header.Get("X-Openrun-Perms")
+		receivedRBACEnabled = r.Header.Get("X-Openrun-Rbac-Enabled")
+		io.WriteString(w, "test contents") //nolint:errcheck
+	}))
+
+	logger := testutil.TestLogger()
+	fileData := map[string]string{
+		"app.star": fmt.Sprintf(`
+load("proxy.in", "proxy")
+
+app = ace.app("testApp", routes = [ace.proxy("/", proxy.config("%s"))],
+permissions=[
+	ace.permission("proxy.in", "config"),
+]
+)`, testServer.URL),
+	}
+
+	a, _, err := CreateTestAppAuthorizer(logger, fileData, []string{"proxy.in"},
+		[]types.Permission{
+			{Plugin: "proxy.in", Method: "config"},
+		}, map[string]types.PluginSettings{}, &testRBAC{perms: []string{"read:data", "write:data", "admin"}})
+	if err != nil {
+		t.Fatalf("Error %s", err)
+	}
+
+	request := httptest.NewRequest("GET", "/test/abc", nil)
+	// Set user ID in context as it would be set by the server middleware
+	ctx := context.WithValue(request.Context(), types.USER_ID, types.ANONYMOUS_USER)
+	request = request.WithContext(ctx)
+	response := httptest.NewRecorder()
+	a.ServeHTTP(response, request)
+
+	testutil.AssertEqualsInt(t, "code", 200, response.Code)
+	testutil.AssertEqualsString(t, "body", "test contents", response.Body.String())
+
+	// Verify the headers were passed to the proxied endpoint
+	testutil.AssertEqualsString(t, "X-Openrun-User", types.ANONYMOUS_USER, receivedUser)
+	testutil.AssertEqualsString(t, "X-Openrun-Perms", "read:data,write:data,admin", receivedPerms)
+	testutil.AssertEqualsString(t, "X-Openrun-Rbac-Enabled", "true", receivedRBACEnabled)
+}
+
+func TestProxyUserHeaderWithAuthentication(t *testing.T) {
+	// Test that X-Openrun-User header contains the authenticated user
+	var receivedUser string
+	var receivedExtra string
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUser = r.Header.Get("X-Openrun-User")
+		receivedExtra = r.Header.Get("X-Openrun-Extra")
+		io.WriteString(w, "test contents") //nolint:errcheck
+	}))
+
+	logger := testutil.TestLogger()
+	fileData := map[string]string{
+		"app.star": fmt.Sprintf(`
+load("proxy.in", "proxy")
+
+app = ace.app("testApp", routes = [ace.proxy("/", proxy.config("%s"))],
+permissions=[
+	ace.permission("proxy.in", "config"),
+]
+)`, testServer.URL),
+	}
+
+	a, _, err := CreateTestAppAuthorizer(logger, fileData, []string{"proxy.in"},
+		[]types.Permission{
+			{Plugin: "proxy.in", Method: "config"},
+		}, map[string]types.PluginSettings{}, &testRBAC{perms: []string{}})
+	if err != nil {
+		t.Fatalf("Error %s", err)
+	}
+
+	request := httptest.NewRequest("GET", "/test/abc", nil)
+	request.Header.Set("X-Openrun-Extra", "testvalue")
+	// Set authenticated user in context as it would be set by the server middleware
+	ctx := context.WithValue(request.Context(), types.USER_ID, "testuser@example.com")
+	request = request.WithContext(ctx)
+	response := httptest.NewRecorder()
+	a.ServeHTTP(response, request)
+
+	testutil.AssertEqualsInt(t, "code", 200, response.Code)
+	testutil.AssertEqualsString(t, "body", "test contents", response.Body.String())
+
+	// Verify the user header was passed to the proxied endpoint
+	testutil.AssertEqualsString(t, "X-Openrun-User", "testuser@example.com", receivedUser)
+	testutil.AssertEqualsString(t, "X-Openrun-Extra", "", receivedExtra)
 }

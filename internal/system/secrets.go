@@ -16,8 +16,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/openrundev/openrun/internal/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/hashicorp/vault/api"
+	"github.com/openrundev/openrun/internal/types"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // SecretManager provides access to the secrets for the system
@@ -29,18 +34,22 @@ type SecretManager struct {
 	defaultProvider string
 }
 
-func NewSecretManager(ctx context.Context, secretConfig map[string]types.SecretConfig, defaultProvider string) (*SecretManager, error) {
+func NewSecretManager(ctx context.Context, secretConfig map[string]types.SecretConfig, defaultProvider string, serverConfig *types.ServerConfig) (*SecretManager, error) {
 	providers := make(map[string]secretProvider)
 	for name, conf := range secretConfig {
 		var provider secretProvider
 		if name == "asm" || strings.HasPrefix(name, "asm_") {
 			provider = &awsSecretProvider{}
+		} else if name == "ssm" || strings.HasPrefix(name, "ssm_") {
+			provider = &awsSSMProvider{}
 		} else if name == "vault" || strings.HasPrefix(name, "vault_") {
 			provider = &vaultSecretProvider{}
 		} else if name == "env" || strings.HasPrefix(name, "env_") {
 			provider = &envSecretProvider{}
 		} else if name == "prop" || strings.HasPrefix(name, "prop_") {
 			provider = &propertiesSecretProvider{}
+		} else if name == "kubernetes" || strings.HasPrefix(name, "kubernetes_") {
+			provider = &kubernetesSecretProvider{namespace: serverConfig.Kubernetes.Namespace}
 		} else {
 			return nil, fmt.Errorf("unknown secret provider %s", name)
 		}
@@ -68,19 +77,19 @@ func NewSecretManager(ctx context.Context, secretConfig map[string]types.SecretC
 // templateSecretFunc is a template function that retrieves a secret from the default secret manager.
 // Since the template function does not support errors, it panics if there is an error
 func (s *SecretManager) templateSecretFunc(secretKeys ...string) string {
-	return s.appTemplateSecretFunc(nil, s.defaultProvider, "", secretKeys...)
+	return s.appTemplateSecretFunc(false, nil, s.defaultProvider, "", secretKeys...)
 }
 
 // templateSecretFromFunc is a template function that retrieves a secret from the secret manager.
 // Since the template function does not support errors, it panics if there is an error
 func (s *SecretManager) templateSecretFromFunc(providerName string, secretKeys ...string) string {
-	return s.appTemplateSecretFunc(nil, s.defaultProvider, providerName, secretKeys...)
+	return s.appTemplateSecretFunc(false, nil, s.defaultProvider, providerName, secretKeys...)
 }
 
 // appTemplateSecretFunc is a template function that retrieves a secret from the secret manager.
 // Since the template function does not support errors, it panics if there is an error. The appPerms
 // are checked to see if the secret can be accessed by the plugin API call
-func (s *SecretManager) appTemplateSecretFunc(appPerms [][]string, defaultProvider, providerName string, secretKeys ...string) string {
+func (s *SecretManager) appTemplateSecretFunc(checkAppPerms bool, appPerms [][]string, defaultProvider, providerName string, secretKeys ...string) string {
 	if providerName == "" || strings.ToLower(providerName) == "default" {
 		// Use the system default provider
 		providerName = cmp.Or(defaultProvider, s.defaultProvider)
@@ -91,37 +100,39 @@ func (s *SecretManager) appTemplateSecretFunc(appPerms [][]string, defaultProvid
 		panic(fmt.Errorf("unknown secret provider %s", providerName))
 	}
 
-	if len(appPerms) == 0 {
-		panic("Plugin does not have access to any secrets, update app permissions")
-	}
+	if checkAppPerms {
+		if len(appPerms) == 0 {
+			panic("Plugin does not have access to any secrets, update app permissions")
+		}
 
-	permMatched := false
-	for _, appPerm := range appPerms {
-		matched := true
-		for i, entry := range secretKeys {
-			if i >= len(appPerm) {
-				continue
+		permMatched := false
+		for _, appPerm := range appPerms {
+			matched := true
+			for i, entry := range secretKeys {
+				if i >= len(appPerm) {
+					continue
+				}
+				if appPerm[i] != entry {
+					regexMatch, err := types.RegexMatch(appPerm[i], entry)
+					if err != nil {
+						panic(fmt.Errorf("error matching secret value %s: %w", entry, err))
+					}
+					if !regexMatch {
+						matched = false
+						break
+					}
+				}
 			}
-			if appPerm[i] != entry {
-				regexMatch, err := types.RegexMatch(appPerm[i], entry)
-				if err != nil {
-					panic(fmt.Errorf("error matching secret value %s: %w", entry, err))
-				}
-				if !regexMatch {
-					matched = false
-					break
-				}
+
+			if matched {
+				permMatched = true
+				break
 			}
 		}
 
-		if matched {
-			permMatched = true
-			break
+		if !permMatched {
+			panic(fmt.Errorf("plugin does not have access to secret %s", strings.Join(secretKeys, provider.GetJoinDelimiter())))
 		}
-	}
-
-	if !permMatched {
-		panic(fmt.Errorf("plugin does not have access to secret %s", strings.Join(secretKeys, provider.GetJoinDelimiter())))
 	}
 
 	secretKey := strings.Join(secretKeys, provider.GetJoinDelimiter())
@@ -184,11 +195,11 @@ func (s *SecretManager) AppEvalTemplate(appSecrets [][]string, defaultProvider, 
 	}
 
 	secretFunc := func(secretKeys ...string) string {
-		return s.appTemplateSecretFunc(appSecrets, defaultProvider, "", secretKeys...)
+		return s.appTemplateSecretFunc(true, appSecrets, defaultProvider, "", secretKeys...)
 	}
 
 	secretFromFunc := func(providerName string, secretKeys ...string) string {
-		return s.appTemplateSecretFunc(appSecrets, defaultProvider, providerName, secretKeys...)
+		return s.appTemplateSecretFunc(true, appSecrets, defaultProvider, providerName, secretKeys...)
 	}
 
 	funcMap["secret"] = secretFunc
@@ -266,6 +277,57 @@ func (a *awsSecretProvider) GetJoinDelimiter() string {
 }
 
 var _ secretProvider = &awsSecretProvider{}
+
+// awsSSMProvider is a secret provider that reads secrets from AWS SSM
+type awsSSMProvider struct {
+	client *ssm.Client
+}
+
+func (a *awsSSMProvider) Configure(ctx context.Context, conf map[string]any) error {
+	profileStr := ""
+	profile, ok := conf["profile"]
+	if ok {
+		profileStr, ok = profile.(string)
+		if !ok {
+			return fmt.Errorf("profile must be a string")
+		}
+	}
+
+	var cfg aws.Config
+	var err error
+	// IAM is automatically supported by config load
+	if profileStr != "" {
+		cfg, err = config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profileStr))
+	} else {
+		cfg, err = config.LoadDefaultConfig(ctx)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	a.client = ssm.NewFromConfig(cfg)
+	return nil
+}
+
+func (a *awsSSMProvider) GetSecret(ctx context.Context, secretName string) (string, error) {
+	input := &ssm.GetParameterInput{
+		Name:           aws.String(secretName),
+		WithDecryption: aws.Bool(true),
+	}
+
+	out, err := a.client.GetParameter(ctx, input)
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(out.Parameter.Value), nil
+}
+
+func (a *awsSSMProvider) GetJoinDelimiter() string {
+	return "/"
+}
+
+var _ secretProvider = &awsSSMProvider{}
 
 // vaultSecretProvider is a secret provider that reads secrets from HashiCorp Vault
 type vaultSecretProvider struct {
@@ -429,3 +491,95 @@ func (e *envSecretProvider) GetJoinDelimiter() string {
 }
 
 var _ secretProvider = &envSecretProvider{}
+
+// kubernetesSecretProvider is a secret provider that reads secrets from Kubernetes secrets
+type kubernetesSecretProvider struct {
+	clientSet *kubernetes.Clientset
+	namespace string
+}
+
+func (k *kubernetesSecretProvider) Configure(ctx context.Context, conf map[string]any) error {
+	// Override namespace from config if explicitly set
+	if ns, ok := conf["namespace"]; ok {
+		nsStr, ok := ns.(string)
+		if !ok {
+			return fmt.Errorf("namespace must be a string")
+		}
+		k.namespace = nsStr
+	}
+
+	// Try to load kubeconfig from config, otherwise use default loading
+	var cfg *rest.Config
+	var err error
+
+	if kubeconfigPath, ok := conf["kubeconfig"]; ok {
+		kubeconfigStr, ok := kubeconfigPath.(string)
+		if !ok {
+			return fmt.Errorf("kubeconfig must be a string")
+		}
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigStr)
+		if err != nil {
+			return fmt.Errorf("error loading kubeconfig from %s: %w", kubeconfigStr, err)
+		}
+	} else {
+		// Try in-cluster config first, then fall back to default kubeconfig
+		cfg, err = rest.InClusterConfig()
+		if err != nil {
+			cfg, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+			if err != nil {
+				return fmt.Errorf("error loading kubernetes config: %w", err)
+			}
+		}
+	}
+
+	clientSet, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("error creating kubernetes clientset: %w", err)
+	}
+
+	k.clientSet = clientSet
+	return nil
+}
+
+// GetSecret retrieves a secret from Kubernetes. The secretName should be in the format
+// "secret-name/key" where secret-name is the Kubernetes secret name and key is the
+// data key within the secret. If no key is specified, it returns the first (and only)
+// key in the secret data.
+func (k *kubernetesSecretProvider) GetSecret(ctx context.Context, secretName string) (string, error) {
+	parts := strings.SplitN(secretName, "/", 2)
+	k8sSecretName := parts[0]
+	var dataKey string
+	if len(parts) > 1 {
+		dataKey = parts[1]
+	}
+
+	secret, err := k.clientSet.CoreV1().Secrets(k.namespace).Get(ctx, k8sSecretName, meta.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("error getting kubernetes secret %s: %w", k8sSecretName, err)
+	}
+
+	if dataKey != "" {
+		value, ok := secret.Data[dataKey]
+		if !ok {
+			return "", fmt.Errorf("key %s not found in kubernetes secret %s", dataKey, k8sSecretName)
+		}
+		return string(value), nil
+	}
+
+	// If no key specified, return the single key's value (error if multiple keys)
+	if len(secret.Data) != 1 {
+		return "", fmt.Errorf("kubernetes secret %s has %d keys, please specify which key to use", k8sSecretName, len(secret.Data))
+	}
+
+	for _, v := range secret.Data {
+		return string(v), nil
+	}
+
+	return "", fmt.Errorf("kubernetes secret %s has no data", k8sSecretName)
+}
+
+func (k *kubernetesSecretProvider) GetJoinDelimiter() string {
+	return "/"
+}
+
+var _ secretProvider = &kubernetesSecretProvider{}

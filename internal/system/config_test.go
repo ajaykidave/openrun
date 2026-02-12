@@ -73,13 +73,18 @@ func TestServerConfig(t *testing.T) {
 	testutil.AssertEqualsInt(t, "attempts", 30, c.AppConfig.Container.HealthAttemptsAfterStartup)
 	testutil.AssertEqualsInt(t, "timeout", 5, c.AppConfig.Container.HealthTimeoutSecs)
 	testutil.AssertEqualsInt(t, "idle", 180, c.AppConfig.Container.IdleShutdownSecs)
-	testutil.AssertEqualsInt(t, "status interval", 5, c.AppConfig.Container.StatusCheckIntervalSecs)
-	testutil.AssertEqualsInt(t, "status attempts", 3, c.AppConfig.Container.StatusHealthAttempts)
+	testutil.AssertEqualsInt(t, "idle bytes high watermark", 1500, c.AppConfig.Container.IdleBytesHighWatermark)
+	testutil.AssertEqualsInt(t, "status interval", 20, c.AppConfig.Container.StatusCheckIntervalSecs)
+	testutil.AssertEqualsInt(t, "status attempts", 10, c.AppConfig.Container.StatusHealthAttempts)
 
 	testutil.AssertEqualsInt(t, "proxy max idle", 250, c.AppConfig.Proxy.MaxIdleConns)
 	testutil.AssertEqualsInt(t, "proxy idle timeout", 15, c.AppConfig.Proxy.IdleConnTimeoutSecs)
 	testutil.AssertEqualsBool(t, "proxy disable compression", true, c.AppConfig.Proxy.DisableCompression)
 	testutil.AssertEqualsString(t, "secrets provider", "env", c.AppConfig.Security.DefaultSecretsProvider)
+
+	testutil.AssertEqualsString(t, "kubernetes namespace", "openrun", c.Kubernetes.Namespace)
+	testutil.AssertEqualsString(t, "builder mode", "auto", c.Builder.Mode)
+	testutil.AssertEqualsString(t, "kaniko image", "ghcr.io/kaniko-build/dist/chainguard-dev-kaniko/executor:v1.25.3-slim", c.Builder.KanikoImage)
 }
 
 func TestClientConfig(t *testing.T) {

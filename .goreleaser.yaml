@@ -1,3 +1,4 @@
+version: 2
 project_name: openrun
 
 release:
@@ -25,18 +26,18 @@ before:
     - go test -race ./...
 
 builds:
-  - main: ./cmd/openrun
+  - id: openrun
+    main: ./cmd/openrun
     binary: openrun
     flags:
       - -trimpath
     ldflags:
       - -w
-      - -X main.gitCommit={{.ShortCommit}}
-      - -X main.gitVersion={{.Version}}
+      - -X github.com/openrundev/openrun/internal/types.gitCommit={{.ShortCommit}}
+      - -X github.com/openrundev/openrun/internal/types.gitVersion={{.Version}}
     env:
       - GO111MODULE=on
       - CGO_ENABLED=0
-      - GOAMD64=v3
     goos:
       - darwin
       - linux
@@ -54,8 +55,8 @@ builds:
 nfpms:
   - file_name_template: "{{.ProjectName}}-{{.Tag}}-{{.Arch}}{{if .Arm}}{{.Arm}}{{end}}"
     homepage: https://openrun.dev/
-    description: Open source alternative to Google Cloud Run and AWS AppRunner.
-    maintainer: Ajay Kidave <contact@clace.io>
+    description: Open source alternative to Google Cloud Run and AWS App Runner.
+    maintainer: Ajay Kidave <contact@openrun.dev>
     license: Apache 2.0
     vendor: ClaceIO LLC.
     formats:
@@ -87,7 +88,6 @@ archives:
 
 # https://goreleaser.com/customization/changelog/
 changelog:
-  skip: false
   use: github
   sort: asc
   groups:
@@ -136,3 +136,24 @@ brews:
           puts "Created localhost TLS certificates"
         end
       end
+
+# New images builder
+dockers_v2:
+  - id: openrun_img
+    ids: [openrun]
+    dockerfile: deploy/Dockerfile
+    # Build both platforms and publish a single multi-arch manifest
+    platforms: [linux/amd64, linux/arm64]
+    images:
+      - ghcr.io/openrundev/openrun
+    tags:
+      - "{{ .Version }}" # e.g. 1.2.3
+      - "sha-{{ .ShortCommit }}"
+      - latest
+    labels:
+      "org.opencontainers.image.title": "openrun"
+      "org.opencontainers.image.description": "OpenRun: Declarative Web App Deployment"
+      "org.opencontainers.image.source": "{{ .GitURL }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.created": "{{ .Date }}"

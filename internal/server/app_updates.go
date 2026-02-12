@@ -78,7 +78,7 @@ func (s *Server) ReloadApp(ctx context.Context, tx types.Transaction, appEntry *
 	}
 	reloadResults := make([]types.AppPathDomain, 0)
 	promoteResults := make([]types.AppPathDomain, 0)
-	if _, err := app.Reload(true, true, types.DryRun(dryRun)); err != nil {
+	if _, err := app.Reload(ctx, true, true, types.DryRun(dryRun), false); err != nil {
 		return nil, fmt.Errorf("error reloading app %s: %w", appEntry, err)
 	}
 	// Persist name in metadata
@@ -97,7 +97,7 @@ func (s *Server) ReloadApp(ctx context.Context, tx types.Transaction, appEntry *
 			return nil, fmt.Errorf("error setting up prod app %s: %w", prodAppEntry, err)
 		}
 
-		if _, err := prodApp.Reload(true, true, types.DryRun(dryRun)); err != nil {
+		if _, err := prodApp.Reload(ctx, true, true, types.DryRun(dryRun), false); err != nil {
 			return nil, fmt.Errorf("error reloading prod app %s: %w", appEntry, err)
 		}
 		// Persist name in metadata
@@ -189,6 +189,7 @@ func (s *Server) loadAppCode(ctx context.Context, tx types.Transaction, appEntry
 		}
 
 		branch = cmp.Or(branch, appEntry.Metadata.VersionMetadata.GitBranch, "main")
+		gitAuth = cmp.Or(gitAuth, appEntry.Metadata.GitAuthName)
 		newSha, err := repoCache.GetSha(appEntry.SourceUrl, branch, gitAuth)
 		if err != nil {
 			return false, fmt.Errorf("error getting git commit sha for %s: %w", appEntry.SourceUrl, err)
@@ -355,7 +356,7 @@ func (s *Server) PromoteApps(ctx context.Context, appPathGlob string, dryRun boo
 		if err != nil {
 			return nil, fmt.Errorf("error setting up prod app %s: %w", prodAppEntry, err)
 		}
-		if _, err := prodApp.Reload(true, true, types.DryRun(dryRun)); err != nil {
+		if _, err := prodApp.Reload(ctx, true, true, types.DryRun(dryRun), false); err != nil {
 			return nil, fmt.Errorf("error reloading prod app %s: %w", prodApp.AppEntry, err)
 		}
 		result = append(result, appInfo.AppPathDomain)
@@ -483,21 +484,6 @@ func (s *Server) updateAppSettings(ctx context.Context, tx types.Transaction, ap
 			}
 		}
 
-		if updateAppRequest.AuthnType != types.StringValueUndefined {
-			if !s.ssoAuth.ValidateAuthType(string(updateAppRequest.AuthnType)) {
-				return nil, fmt.Errorf("invalid authentication type %s", updateAppRequest.AuthnType)
-			}
-			linkedApp.Settings.AuthnType = types.AppAuthnType(updateAppRequest.AuthnType)
-		}
-
-		if updateAppRequest.GitAuthName != types.StringValueUndefined {
-			if updateAppRequest.GitAuthName == "-" {
-				linkedApp.Settings.GitAuthName = ""
-			} else {
-				linkedApp.Settings.GitAuthName = string(updateAppRequest.GitAuthName)
-			}
-		}
-
 		if err := s.db.UpdateAppSettings(ctx, tx, linkedApp); err != nil {
 			return nil, err
 		}
@@ -602,16 +588,31 @@ func (s *Server) updateAppMetadataConfig(appEntry *types.AppEntry, configType ty
 	if len(configEntries) == 0 {
 		return nil
 	}
+	value := configEntries[0]
+	if configType == types.AppMetadataAuthnType || configType == types.AppMetadataGitAuthName {
+		if len(configEntries) > 1 {
+			return fmt.Errorf("expected only one value for %s, got %d", configType, len(configEntries))
+		}
+	}
 
-	if configType == types.AppMetadataContainerVolumes {
+	switch configType {
+	case types.AppMetadataContainerVolumes:
 		appEntry.Metadata.ContainerVolumes = configEntries
+		return nil
+	case types.AppMetadataAuthnType:
+		if err := s.validateAppAuthnType(string(value)); err != nil {
+			return err
+		}
+		appEntry.Metadata.AuthnType = types.AppAuthnType(value)
+		return nil
+	case types.AppMetadataGitAuthName:
+		appEntry.Metadata.GitAuthName = string(value)
 		return nil
 	}
 
 	for _, entry := range configEntries {
 		key, value, ok := strings.Cut(entry, "=")
-
-		if !ok && configType != types.AppMetadataContainerOptions {
+		if !ok {
 			return fmt.Errorf("invalid %s %s, need key=value", configType, entry)
 		}
 
@@ -649,7 +650,6 @@ func (s *Server) updateAppMetadataConfig(appEntry *types.AppEntry, configType ty
 			} else {
 				delete(appEntry.Metadata.AppConfig, key)
 			}
-		// case AppMetadataContainerVolumes not expected here, already handled
 		default:
 			return fmt.Errorf("invalid config type %s", configType)
 		}

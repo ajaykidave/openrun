@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/caddyserver/certmagic"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -21,11 +22,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const CURRENT_DB_VERSION = 6
+const CURRENT_DB_VERSION = 9
 
 // Metadata is the metadata persistence layer
 type Metadata struct {
 	*types.Logger
+	certStorage      *CertStorage
 	config           *types.ServerConfig
 	db               *sql.DB
 	dbType           system.DBType
@@ -42,12 +44,18 @@ func NewMetadata(logger *types.Logger, config *types.ServerConfig) (*Metadata, e
 	if err != nil {
 		return nil, fmt.Errorf("error initializing db: %w", err)
 	}
+
 	m := &Metadata{
 		Logger: logger,
 		config: config,
 		db:     db,
 		dbType: dbType,
 	}
+	certStorage, err := NewCertStorage(context.Background(), logger, m)
+	if err != nil {
+		return nil, fmt.Errorf("error initializing cert storage: %w", err)
+	}
+	m.certStorage = certStorage
 
 	err = m.VersionUpgrade(config)
 	if err != nil {
@@ -113,6 +121,11 @@ func NewMetadata(logger *types.Logger, config *types.ServerConfig) (*Metadata, e
 	}
 
 	return m, nil
+}
+
+// GetCertStorage returns the cert storage implementation which persists the cert info to the database.
+func (m *Metadata) GetCertStorage() certmagic.Storage {
+	return m.certStorage
 }
 
 // NotifyAppUpdate sends a notification through the postgres listener that an app has been updated
@@ -258,6 +271,40 @@ func (m *Metadata) VersionUpgrade(config *types.ServerConfig) error {
 		}
 	}
 
+	if version < 7 {
+		m.Info().Msg("Upgrading to version 7")
+		if _, err := tx.ExecContext(ctx, `create table keystore(key text, value `+system.MapDataType(m.dbType, "blob")+
+			`, create_time `+system.MapDataType(m.dbType, "datetime")+`, delete_at `+system.MapDataType(m.dbType, "datetime")+`, PRIMARY KEY(key))`); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `update version set version=7, last_upgraded=`+system.FuncNow(m.dbType)); err != nil {
+			return err
+		}
+	}
+
+	if version < 8 {
+		m.Info().Msg("Upgrading to version 8")
+		err := m.migrateAuthSettings(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `update version set version=8, last_upgraded=`+system.FuncNow(m.dbType)); err != nil {
+			return err
+		}
+	}
+
+	if version < 9 {
+		m.Info().Msg("Upgrading to version 9")
+		if err := m.certStorage.createTables(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `update version set version=9, last_upgraded=`+system.FuncNow(m.dbType)); err != nil {
+			return err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -274,6 +321,88 @@ func (m *Metadata) initFileTables(ctx context.Context, tx types.Transaction) err
 	}
 	if _, err := tx.ExecContext(ctx, `create table app_files (appid text, version int, name text, sha text, uncompressed_size int, create_time `+system.MapDataType(m.dbType, "datetime")+", PRIMARY KEY(appid, version, name))"); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+type appMetadataAndSettings struct {
+	path     string
+	domain   string
+	metadata *types.AppMetadata
+	settings *types.AppSettings
+}
+
+func (m *Metadata) getAppMetadataAndSettings(ctx context.Context, tx types.Transaction) ([]appMetadataAndSettings, error) {
+	stmt, err := tx.PrepareContext(ctx, system.RebindQuery(m.dbType, `select domain, path, settings, metadata from apps`))
+	if err != nil {
+		return nil, fmt.Errorf("error preparing statement: %w", err)
+	}
+	defer stmt.Close() //nolint:errcheck
+
+	rows, err := stmt.Query()
+	if err != nil {
+		return nil, fmt.Errorf("error querying apps metadata: %w", err)
+	}
+	apps := make([]appMetadataAndSettings, 0)
+	defer rows.Close() //nolint:errcheck
+	for rows.Next() {
+		var path, domain string
+		var settingsStr, metadataStr sql.NullString
+		err = rows.Scan(&domain, &path, &settingsStr, &metadataStr)
+		if err != nil {
+			return nil, fmt.Errorf("error querying next app: %w", err)
+		}
+
+		var metadata types.AppMetadata
+		var settings types.AppSettings
+
+		if metadataStr.Valid && metadataStr.String != "" {
+			err = json.Unmarshal([]byte(metadataStr.String), &metadata)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshalling metadata: %w", err)
+			}
+		}
+
+		if settingsStr.Valid && settingsStr.String != "" {
+			err = json.Unmarshal([]byte(settingsStr.String), &settings)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshalling settings: %w", err)
+			}
+		}
+
+		apps = append(apps, appMetadataAndSettings{
+			path:     path,
+			domain:   domain,
+			metadata: &metadata,
+			settings: &settings,
+		})
+	}
+	if closeErr := rows.Close(); closeErr != nil {
+		return nil, fmt.Errorf("error closing rows: %w", closeErr)
+	}
+	return apps, nil
+}
+
+// migrateAuthSettings migrates the auth settings (app auth and git auth) from the app settings to the app metadata
+func (m *Metadata) migrateAuthSettings(ctx context.Context, tx types.Transaction) error {
+	allApps, err := m.getAppMetadataAndSettings(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("error getting app metadata and settings: %w", err)
+	}
+	for _, app := range allApps {
+		app.metadata.AuthnType = app.settings.AuthnType     //nolint:staticcheck // deprecated
+		app.settings.AuthnType = ""                         //nolint:staticcheck // deprecated
+		app.metadata.GitAuthName = app.settings.GitAuthName // nolint:staticcheck // deprecated
+		app.settings.GitAuthName = ""                       //nolint:staticcheck // deprecated
+		err := m.updateAppMetadata(ctx, tx, app.path, app.domain, app.metadata)
+		if err != nil {
+			return fmt.Errorf("error updating app metadata: %w", err)
+		}
+		err = m.updateAppSettings(ctx, tx, app.path, app.domain, app.settings)
+		if err != nil {
+			return fmt.Errorf("error updating app settings: %w", err)
+		}
 	}
 
 	return nil
@@ -380,7 +509,7 @@ func (m *Metadata) GetAppsForDomain(domain string) ([]string, error) {
 
 	rows, err := stmt.Query(domain)
 	if err != nil {
-		return nil, fmt.Errorf("error querying apps: %w", err)
+		return nil, fmt.Errorf("error querying domain apps: %w", err)
 	}
 
 	paths := make([]string, 0)
@@ -389,7 +518,7 @@ func (m *Metadata) GetAppsForDomain(domain string) ([]string, error) {
 		var path string
 		err = rows.Scan(&path)
 		if err != nil {
-			return nil, fmt.Errorf("error querying apps: %w", err)
+			return nil, fmt.Errorf("error scanning domain app: %w", err)
 		}
 		paths = append(paths, path)
 	}
@@ -401,7 +530,7 @@ func (m *Metadata) GetAppsForDomain(domain string) ([]string, error) {
 }
 
 func (m *Metadata) GetAllApps(includeInternal bool) ([]types.AppInfo, error) {
-	sqlStr := `select domain, path, is_dev, id, main_app, settings, metadata, source_url from apps`
+	sqlStr := `select domain, path, is_dev, id, main_app, settings, metadata, source_url, update_time from apps`
 	if !includeInternal {
 		sqlStr += ` where main_app = ''`
 	}
@@ -415,7 +544,7 @@ func (m *Metadata) GetAllApps(includeInternal bool) ([]types.AppInfo, error) {
 
 	rows, err := stmt.Query()
 	if err != nil {
-		return nil, fmt.Errorf("error querying apps: %w", err)
+		return nil, fmt.Errorf("error querying all apps: %w", err)
 	}
 	apps := make([]types.AppInfo, 0)
 	defer rows.Close() //nolint:errcheck
@@ -423,9 +552,10 @@ func (m *Metadata) GetAllApps(includeInternal bool) ([]types.AppInfo, error) {
 		var path, domain, id, mainApp, sourceUrl string
 		var isDev bool
 		var settingsStr, metadataStr sql.NullString
-		err = rows.Scan(&domain, &path, &isDev, &id, &mainApp, &settingsStr, &metadataStr, &sourceUrl)
+		var updateTime *time.Time
+		err = rows.Scan(&domain, &path, &isDev, &id, &mainApp, &settingsStr, &metadataStr, &sourceUrl, &updateTime)
 		if err != nil {
-			return nil, fmt.Errorf("error querying apps: %w", err)
+			return nil, fmt.Errorf("error querying next app: %w", err)
 		}
 
 		var metadata types.AppMetadata
@@ -446,9 +576,9 @@ func (m *Metadata) GetAllApps(includeInternal bool) ([]types.AppInfo, error) {
 		}
 
 		apps = append(apps, types.CreateAppInfo(types.AppId(id), metadata.Name, path, domain, isDev,
-			types.AppId(mainApp), settings.AuthnType, sourceUrl, metadata.Spec,
+			types.AppId(mainApp), metadata.AuthnType, sourceUrl, metadata.Spec,
 			metadata.VersionMetadata.Version, metadata.VersionMetadata.GitCommit, metadata.VersionMetadata.GitMessage,
-			metadata.VersionMetadata.GitBranch, types.StripQuotes(metadata.AppConfig["star_base"])))
+			metadata.VersionMetadata.GitBranch, types.StripQuotes(metadata.AppConfig["star_base"]), *updateTime))
 	}
 	if closeErr := rows.Close(); closeErr != nil {
 		return nil, fmt.Errorf("error closing rows: %w", closeErr)
@@ -466,7 +596,7 @@ func (m *Metadata) GetLinkedApps(ctx context.Context, tx types.Transaction, main
 
 	rows, err := stmt.Query(mainAppId)
 	if err != nil {
-		return nil, fmt.Errorf("error querying apps: %w", err)
+		return nil, fmt.Errorf("error querying linked apps: %w", err)
 	}
 	apps := make([]*types.AppEntry, 0)
 	defer rows.Close() //nolint:errcheck
@@ -514,14 +644,14 @@ func (m *Metadata) UpdateSourceUrl(ctx context.Context, tx types.Transaction, ap
 }
 
 func (m *Metadata) UpdateAppMetadata(ctx context.Context, tx types.Transaction, app *types.AppEntry) error {
+	err := m.updateAppMetadata(ctx, tx, app.Path, app.Domain, &app.Metadata)
+	if err != nil {
+		return fmt.Errorf("error updating app metadata: %w", err)
+	}
+
 	metadataJson, err := json.Marshal(app.Metadata)
 	if err != nil {
 		return fmt.Errorf("error marshalling metadata: %w", err)
-	}
-
-	_, err = tx.ExecContext(ctx, system.RebindQuery(m.dbType, `UPDATE apps set metadata = ? where path = ? and domain = ?`), string(metadataJson), app.Path, app.Domain)
-	if err != nil {
-		return fmt.Errorf("error updating app metadata: %w", err)
 	}
 
 	if strings.HasPrefix(string(app.Id), types.ID_PREFIX_APP_PROD) || strings.HasPrefix(string(app.Id), types.ID_PREFIX_APP_STAGE) {
@@ -534,13 +664,31 @@ func (m *Metadata) UpdateAppMetadata(ctx context.Context, tx types.Transaction, 
 	return nil
 }
 
+func (m *Metadata) updateAppMetadata(ctx context.Context, tx types.Transaction, path, domain string, metadata *types.AppMetadata) error {
+	metadataJson, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("error marshalling metadata: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, system.RebindQuery(m.dbType, `UPDATE apps set metadata = ?, update_time = `+system.FuncNow(m.dbType)+` where path = ? and domain = ?`), string(metadataJson), path, domain)
+	if err != nil {
+		return fmt.Errorf("error updating app metadata: %w", err)
+	}
+
+	return nil
+}
+
 func (m *Metadata) UpdateAppSettings(ctx context.Context, tx types.Transaction, app *types.AppEntry) error {
-	settingsJson, err := json.Marshal(app.Settings)
+	return m.updateAppSettings(ctx, tx, app.Path, app.Domain, &app.Settings)
+}
+
+func (m *Metadata) updateAppSettings(ctx context.Context, tx types.Transaction, path, domain string, settings *types.AppSettings) error {
+	settingsJson, err := json.Marshal(settings)
 	if err != nil {
 		return fmt.Errorf("error marshalling settings: %w", err)
 	}
 
-	_, err = tx.ExecContext(ctx, system.RebindQuery(m.dbType, `UPDATE apps set settings = ? where path = ? and domain = ?`), string(settingsJson), app.Path, app.Domain)
+	_, err = tx.ExecContext(ctx, system.RebindQuery(m.dbType, `UPDATE apps set settings = ?, update_time = `+system.FuncNow(m.dbType)+` where path = ? and domain = ?`), string(settingsJson), path, domain)
 	if err != nil {
 		return fmt.Errorf("error updating app settings: %w", err)
 	}
@@ -752,6 +900,85 @@ func (m *Metadata) GetConfig() (*types.DynamicConfig, error) {
 	}
 
 	return &config, nil
+}
+
+func (m *Metadata) FetchKV(ctx context.Context, key string) (map[string]any, error) {
+	value, err := m.FetchKVBlob(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching value: %w", err)
+	}
+	var valueMap map[string]any
+	err = json.Unmarshal([]byte(value), &valueMap)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling value: %w", err)
+	}
+	return valueMap, nil
+}
+
+func (m *Metadata) FetchKVBlob(ctx context.Context, key string) ([]byte, error) {
+	row := m.db.QueryRowContext(ctx, system.RebindQuery(m.dbType, `select value from keystore where key = ? and (delete_at is null or delete_at > `+system.FuncNow(m.dbType)+`)`), key)
+	var value []byte
+	err := row.Scan(&value)
+	if err != nil {
+		return nil, fmt.Errorf("error querying keystore: %w", err)
+	}
+	return value, nil
+}
+
+func (m *Metadata) StoreKV(ctx context.Context, key string, value map[string]any, expireAt *time.Time) error {
+	valueJson, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("error marshalling value: %w", err)
+	}
+	return m.StoreKVBlob(ctx, key, valueJson, expireAt)
+}
+
+func (m *Metadata) StoreKVBlob(ctx context.Context, key string, value []byte, expireAt *time.Time) error {
+	_, err := m.db.ExecContext(ctx, system.RebindQuery(m.dbType,
+		`insert into keystore values (?, ?, `+system.FuncNow(m.dbType)+`, ?)`), key, value, toNullTime(expireAt))
+	if err != nil {
+		return fmt.Errorf("error storing value: %w", err)
+	}
+	return nil
+}
+
+func (m *Metadata) UpdateKV(ctx context.Context, key string, value map[string]any) error {
+	valueJson, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("error marshalling value: %w", err)
+	}
+	return m.UpdateKVBlob(ctx, key, valueJson)
+}
+
+func (m *Metadata) UpdateKVBlob(ctx context.Context, key string, value []byte) error {
+	result, err := m.db.ExecContext(ctx, system.RebindQuery(m.dbType,
+		`update keystore set value = ? where key = ?`), value, key)
+	if err != nil {
+		return fmt.Errorf("error updating value: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("error getting rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("no key entry found with key for update: %s", key)
+	}
+	return nil
+}
+
+func (m *Metadata) DeleteKV(ctx context.Context, key string) error {
+	_, err := m.db.ExecContext(ctx, system.RebindQuery(m.dbType, `delete from keystore where key = ?`), key)
+	if err != nil {
+		return fmt.Errorf("error deleting value: %w", err)
+	}
+	return nil
+}
+
+func toNullTime(t *time.Time) sql.NullTime {
+	if t == nil {
+		return sql.NullTime{Valid: false}
+	}
+	return sql.NullTime{Time: *t, Valid: true}
 }
 
 // BeginTransaction starts a new Transaction

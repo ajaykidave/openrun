@@ -21,6 +21,7 @@ import (
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/openrundev/openrun/internal/app"
+	"github.com/openrundev/openrun/internal/container"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 )
@@ -91,7 +92,6 @@ func panicRecovery(next http.Handler) http.Handler {
 // NewUDSHandler creates a new handler for admin APIs over the unix domain socket
 func NewUDSHandler(logger *types.Logger, config *types.ServerConfig, server *Server) *Handler {
 	router := chi.NewRouter()
-
 	router.Use(server.handleStatus)
 	router.Use(panicRecovery)
 
@@ -116,6 +116,7 @@ func NewUDSHandler(logger *types.Logger, config *types.ServerConfig, server *Ser
 // authentication is enabled. It also mounts the internal APIs if admin over TCP is enabled
 func NewTCPHandler(logger *types.Logger, config *types.ServerConfig, server *Server) *Handler {
 	router := chi.NewRouter()
+
 	handler := &Handler{
 		Logger: logger,
 		config: config,
@@ -136,17 +137,23 @@ func NewTCPHandler(logger *types.Logger, config *types.ServerConfig, server *Ser
 	if config.Security.AdminOverTCP {
 		// Mount the internal API's only if admin over TCP is enabled
 		logger.Warn().Msg("Admin API access over TCP is enabled, enable 2FA for admin user account")
-		router.Mount(types.INTERNAL_URL_PREFIX, handler.serveInternal(true))
+		router.Mount(types.INTERNAL_URL_PREFIX, server.csrfMiddleware.Handler(handler.serveInternal(true)))
 	} else {
-		router.Mount(types.INTERNAL_URL_PREFIX, http.NotFoundHandler()) // reserve the path
+		router.Mount(types.INTERNAL_URL_PREFIX, server.csrfMiddleware.Handler(http.NotFoundHandler())) // reserve the path
 	}
 
 	// Webhooks are always mounted, they are disabled at the app level by default
-	router.Mount(types.WEBHOOK_URL_PREFIX, handler.serveWebhooks())
+	router.Mount(types.WEBHOOK_URL_PREFIX, server.csrfMiddleware.Handler(handler.serveWebhooks()))
 
-	server.ssoAuth.RegisterRoutes(router) // register SSO routes
+	server.oAuthManager.RegisterRoutes(router) // register OAuth routes
+	server.samlManager.RegisterRoutes(router)  // register SAML routes
 
 	router.HandleFunc("/*", handler.callApp)
+	router.HandleFunc(types.INTERNAL_URL_PREFIX+"/health",
+		func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			w.Write([]byte("OK")) //nolint:errcheck
+		})
 	router.HandleFunc("/testperf", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
@@ -212,14 +219,14 @@ func (h *Handler) callApp(w http.ResponseWriter, r *http.Request) {
 	var serveApp *app.App
 	var err error
 	if !serveListApps {
-		serveApp, err = h.server.GetApp(matchedApp.AppPathDomain, true)
+		serveApp, err = h.server.GetApp(r.Context(), matchedApp.AppPathDomain, true)
 		if err != nil {
 			h.Error().Err(err).Str("path", r.URL.Path).Msg("Error getting app")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
-		serveApp, err = h.server.GetListAppsApp()
+		serveApp, err = h.server.GetListAppsApp(r.Context())
 		if err != nil {
 			h.Error().Err(err).Str("path", r.URL.Path).Msg("Error getting list_apps app")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -330,7 +337,7 @@ func (h *Handler) webhookHandler(w http.ResponseWriter, r *http.Request, webhook
 		return
 	}
 
-	app, err := h.server.GetApp(appPathDomain, false)
+	app, err := h.server.GetApp(r.Context(), appPathDomain, false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1235,6 +1242,11 @@ func (h *Handler) serveInternal(enableBasicAuth bool) http.Handler {
 	// API to update config
 	r.Post("/config", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.apiHandler(w, r, enableBasicAuth, "config_update", h.configUpdate)
+	}))
+
+	// API to delegate build
+	r.Post("/delegate_build", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		container.DelegateHandler(w, r, h.config, h.Logger)
 	}))
 
 	return r

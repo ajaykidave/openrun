@@ -9,6 +9,12 @@ MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
 OPENRUN_HOME := `pwd`
 INPUT := $(word 2,$(MAKECMDGOALS))
+INPUT2 := $(word 3,$(MAKECMDGOALS))
+
+ARCH        := $(shell uname -m)
+TARGET_DIR  := dist/linux/$(ARCH)
+BINARY      := openrun
+IMAGE_TAG   := openrun:latest
 
 .DEFAULT_GOAL := help
 ifeq ($(origin .RECIPEPREFIX), undefined)
@@ -17,13 +23,20 @@ endif
 .RECIPEPREFIX = >
 TAG := 
 
-.PHONY: help test unit int release int_single lint verify
+.PHONY: help test unit int covtest covunit covint release int_single lint verify build-linux image tags
 
 help: ## Display this help section
 > @awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "\033[36m%-38s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 test: unit int ## Run all tests
 verify: lint test ## Run lint and all tests
+
+build-linux: ## Build linux binary into dist/
+> mkdir -p $(TARGET_DIR)
+> CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -o $(TARGET_DIR)/$(BINARY) ./cmd/openrun
+
+image: build-linux ## Build docker image
+> docker build -f deploy/Dockerfile -t $(IMAGE_TAG) dist
 
 covtest: covunit covint ## Run all tests with coverage
 > go tool covdata percent -i=$(OPENRUN_HOME)/coverage/client,$(OPENRUN_HOME)/coverage/unit,$(OPENRUN_HOME)/coverage/int
@@ -57,9 +70,32 @@ covint: ## Run integration tests with coverage
 > go tool covdata textfmt -i=$(OPENRUN_HOME)/coverage/client,$(OPENRUN_HOME)/coverage/int -o $(OPENRUN_HOME)/coverage/profile
 > go tool cover -func coverage/profile
 
-release: ## Tag and push a release
-> @if [ -z "$(TAG)" ]; then \
->    echo "Error: TAG is not set"; \
+tags: ## Show current release version tags
+> @echo "OpenRun   : " `git tag -l --sort=-creatordate | head -n 1`
+> @cd ../openrun-helm-charts/
+> @git pull > /dev/null
+> @echo "Helm Chart: " `git tag -l --sort=-creatordate | head -n 1`
+> @cd - > /dev/null
+
+release: ## Tag and push a release; args: <app_version> <helm_version>
+> @if [[ -z "$(INPUT)" || "$(INPUT)" == v* ]]; then \
+>    echo "Error: OpenRun version has to be set, without the v prefix"; \
 >    exit 1; \
 > fi
-> git tag -a v$(TAG) -m "Release v$(TAG)"; git push origin v$(TAG)
+> @if [[ -z "$(INPUT2)" || "$(INPUT2)" == openrun* ]]; then \
+>    echo "Error: Helm version has to be set, without the openrun prefix"; \
+>    exit 1; \
+> fi
+> git tag -a v$(INPUT) -m "Release v$(INPUT)"; git push origin v$(INPUT)
+> @cd ../openrun-helm-charts/
+> sed -i.bak -E "s/^([[:space:]]*version:[[:space:]]*)[^#[:space:]]+/\1${INPUT2}/" charts/openrun/Chart.yaml
+> mv charts/openrun/Chart.yaml.bak /tmp/chart.bak1
+> sed -i.bak -E "s/^([[:space:]]*appVersion:[[:space:]]*)[^#[:space:]]+/\1${INPUT}/" charts/openrun/Chart.yaml
+> mv charts/openrun/Chart.yaml.bak /tmp/chart.bak2
+> git add charts/openrun/Chart.yaml
+> git commit -m "Updated Helm chart to $(INPUT2), app version to $(INPUT)"
+> echo "************************************************** "
+> echo "   cd ../openrun-helm-charts/ && git push"
+> echo "************************************************** "
+> echo "Run above command to push the Helm chart after the OpenRun release job is done"
+> @cd - > /dev/null

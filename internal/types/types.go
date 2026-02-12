@@ -18,6 +18,20 @@ import (
 	"github.com/openrundev/openrun/internal/app/starlark_type"
 )
 
+// Added by goreleaser as build information
+var (
+	gitCommit  string // gitCommit is the git commit that was compiled
+	gitVersion string // gitVersion is the build tag
+)
+
+func GetVersion() string {
+	return cmp.Or(gitVersion, "dev")
+}
+
+func GetCommit() string {
+	return cmp.Or(gitCommit, "dev_build")
+}
+
 const (
 	OPENRUN_HOME            = "OPENRUN_HOME"
 	ID_PREFIX_APP_PROD      = "app_prd_"
@@ -55,7 +69,7 @@ const (
 	TL_AUDIT_OPERATION          = "TL_audit_operation"
 	TL_AUDIT_TARGET             = "TL_audit_target"
 	TL_AUDIT_DETAIL             = "TL_audit_detail"
-	TL_CONTAINER_MANAGER        = "TL_container_manager"
+	TL_CONTAINER_HANDLER        = "TL_container_handler"
 	TL_BRANCH                   = "TL_branch"
 	TL_DEV                      = "TL_dev"
 	TL_APP_URL                  = "TL_app_url"
@@ -66,6 +80,8 @@ const (
 	CONTAINER_SOURCE_NIXPACKS     = "nixpacks"
 	CONTAINER_SOURCE_IMAGE_PREFIX = "image:"
 	CONTAINER_LIFETIME_COMMAND    = "command"
+
+	CONTAINER_KUBERNETES = "kubernetes"
 )
 
 const (
@@ -89,9 +105,13 @@ type ServerConfig struct {
 	Metadata    MetadataConfig              `toml:"metadata"`
 	Log         LogConfig                   `toml:"logging"`
 	System      SystemConfig                `toml:"system"`
+	Registry    RegistryConfig              `toml:"registry"`
+	Builder     BuilderConfig               `toml:"builder"`
+	Kubernetes  KubernetesConfig            `toml:"kubernetes"`
 	GitAuth     map[string]GitAuthEntry     `toml:"git_auth"`
 	Plugins     map[string]PluginSettings   `toml:"plugin"`
 	Auth        map[string]AuthConfig       `toml:"auth"`
+	SAML        map[string]SAMLConfig       `toml:"saml"`
 	ClientAuth  map[string]ClientCertConfig `toml:"client_auth"`
 	Secret      map[string]SecretConfig     `toml:"secret"`
 	ProfileMode string                      `toml:"profile_mode"`
@@ -104,16 +124,18 @@ type SecretConfig map[string]any
 type NodeConfig map[string]any
 
 type AppConfig struct {
-	CORS      CORS      `toml:"cors"`
-	Container Container `toml:"container"`
-	Proxy     Proxy     `toml:"proxy"`
-	FS        FS        `toml:"fs"`
-	Audit     Audit     `toml:"audit"`
-	Security  Security  `toml:"security"`
-	StarBase  string    `toml:"star_base"` // The base directory for starlark config files
+	CORS       CORS       `toml:"cors"`
+	Container  Container  `toml:"container"`
+	Kubernetes Kubernetes `toml:"kubernetes"`
+	Proxy      Proxy      `toml:"proxy"`
+	FS         FS         `toml:"fs"`
+	Audit      Audit      `toml:"audit"`
+	Security   Security   `toml:"security"`
+	StarBase   string     `toml:"star_base"` // The base directory for starlark config files
 }
 type Security struct {
 	DefaultSecretsProvider string `toml:"default_secrets_provider"`
+	DisableCSRFProtection  bool   `toml:"disable_csrf_protection"`
 }
 
 type CORS struct {
@@ -139,13 +161,24 @@ type Container struct {
 	HealthAttemptsAfterStartup int    `toml:"health_attempts_after_startup"`
 	HealthTimeoutSecs          int    `toml:"health_timeout_secs"`
 
+	LogLinesToShow     int  `toml:"log_lines_to_show"`
+	ShowLogsForFailure bool `toml:"show_logs_for_failure"`
+
 	// Idle shutdown related config
-	IdleShutdownSecs    int  `toml:"idle_shutdown_secs"`
-	IdleShutdownDevApps bool `toml:"idle_shutdown_dev_apps"`
+	IdleShutdownSecs       int  `toml:"idle_shutdown_secs"`
+	IdleShutdownDevApps    bool `toml:"idle_shutdown_dev_apps"`
+	IdleBytesHighWatermark int  `toml:"idle_bytes_high_watermark"`
 
 	// Status check related config
 	StatusCheckIntervalSecs int `toml:"status_check_interval_secs"`
 	StatusHealthAttempts    int `toml:"status_health_attempts"`
+}
+
+// Kubernetes related settings in the App Config
+type Kubernetes struct {
+	DefaultVolumeSize   string `toml:"default_volume_size"`
+	StrictVersionCheck  bool   `toml:"strict_version_check"`  // If true, only return true if the version hash is the same as the expected hash
+	ScalingThresholdCPU int32  `toml:"scaling_threshold_cpu"` // CPU utilization threshold for HPA scaling
 }
 
 type Proxy struct {
@@ -189,8 +222,6 @@ type SecurityConfig struct {
 	AdminOverTCP             bool   `toml:"admin_over_tcp"`
 	AdminPasswordBcrypt      string `toml:"admin_password_bcrypt"`
 	AppDefaultAuthType       string `toml:"app_default_auth_type"`
-	SessionSecret            string `toml:"session_secret"`
-	SessionBlockKey          string `toml:"session_block_key"`
 	SessionMaxAge            int    `toml:"session_max_age"`
 	SessionHttpsOnly         bool   `toml:"session_https_only"`
 	CallbackUrl              string `toml:"callback_url"`
@@ -225,6 +256,7 @@ type SystemConfig struct {
 	WatchIgnorePatterns       []string `toml:"watch_ignore_patterns"`
 	NodePath                  string   `toml:"node_path"`
 	ContainerCommand          string   `toml:"container_command"`
+	ContainerBuilder          string   `toml:"container_builder"`
 	DefaultDomain             string   `toml:"default_domain"`
 	RootServeListApps         string   `toml:"root_serve_list_apps"`
 	EnableCompression         bool     `toml:"enable_compression"`
@@ -235,6 +267,32 @@ type SystemConfig struct {
 	MaxSyncFailureCount       int      `toml:"max_sync_failure_count"` // Max failure count for sync jobs
 	MaxConcurrentBuilds       int      `toml:"max_concurrent_builds"`  // Max concurrent container builds
 	MaxBuildWaitSecs          int      `toml:"max_build_wait_secs"`    // Max wait time for a build lock
+	EarlyHints                bool     `toml:"early_hints"`            // enable early hints for HTML responses
+}
+
+type RegistryConfig struct {
+	URL            string `toml:"url"`
+	Project        string `toml:"project"`
+	Type           string `toml:"type"` // "", "ecr"
+	Username       string `toml:"username"`
+	Password       string `toml:"password"`
+	PasswordFile   string `toml:"password_file"`
+	CAFile         string `toml:"ca_file"`
+	ClientCertFile string `toml:"client_cert_file"`
+	ClientKeyFile  string `toml:"client_key_file"`
+	Insecure       bool   `toml:"insecure"`
+	AWSRegion      string `toml:"aws_region"`
+}
+
+type KubernetesConfig struct {
+	Namespace   string `toml:"namespace"`
+	UseNodePort bool   `toml:"use_node_port"` // Use NodePort mode instead of default ClusterIP mode
+	// Can be used with k3s for single node cluster where the OpenRun server is not running as a pod
+}
+
+type BuilderConfig struct {
+	Mode        string `toml:"mode"` // "auto", "kaniko", "command", "delegate:<url>"
+	KanikoImage string `toml:"kaniko_image"`
 }
 
 // GitAuth is a github auth config entry
@@ -305,6 +363,7 @@ type AppInfo struct {
 	GitMessage string
 	Branch     string
 	StarBase   string
+	UpdateTime time.Time
 }
 
 func CreateAppPathDomain(path, domain string) AppPathDomain {
@@ -316,7 +375,7 @@ func CreateAppPathDomain(path, domain string) AppPathDomain {
 
 func CreateAppInfo(id AppId, name, path, domain string, isDev bool, mainApp AppId,
 	auth AppAuthnType, sourceUrl string, spec AppSpec,
-	version int, gitSha, gitMessage, branch, starBase string) AppInfo {
+	version int, gitSha, gitMessage, branch, starBase string, updatedAt time.Time) AppInfo {
 	return AppInfo{
 		AppPathDomain: AppPathDomain{
 			Path:   path,
@@ -334,6 +393,7 @@ func CreateAppInfo(id AppId, name, path, domain string, isDev bool, mainApp AppI
 		GitMessage: gitMessage,
 		Branch:     branch,
 		StarBase:   starBase,
+		UpdateTime: updatedAt,
 	}
 }
 
@@ -413,11 +473,15 @@ type AppMetadata struct {
 	ContainerArgs    map[string]string `json:"container_args"`
 	ContainerVolumes []string          `json:"container_volumes"`
 	AppConfig        map[string]string `json:"appconfig"`
+	AuthnType        AppAuthnType      `json:"authn_type"`
+	GitAuthName      string            `json:"git_auth_name"`
 }
 
 // AppSettings contains the settings for an app. Settings are not version controlled.
 type AppSettings struct {
-	AuthnType          AppAuthnType  `json:"authn_type"`
+	//Deprecated: use AppMetadata.AuthnType instead
+	AuthnType AppAuthnType `json:"authn_type"`
+	//Deprecated: use AppMetadata.GitAuthName instead
 	GitAuthName        string        `json:"git_auth_name"`
 	StageWriteAccess   bool          `json:"stage_write_access"`
 	PreviewWriteAccess bool          `json:"preview_write_access"`
@@ -497,6 +561,8 @@ const (
 	AppMetadataContainerOptions AppMetadataConfigType = "container_options"
 	AppMetadataContainerArgs    AppMetadataConfigType = "container_args"
 	AppMetadataContainerVolumes AppMetadataConfigType = "container_volumes"
+	AppMetadataAuthnType        AppMetadataConfigType = "auth"
+	AppMetadataGitAuthName      AppMetadataConfigType = "git_auth"
 )
 
 type AppVersion struct {
@@ -722,3 +788,29 @@ const (
 )
 
 type AuthorizerFunc func(ctx context.Context, permissions []string) (bool, error)
+type CustomPermsFunc func(ctx context.Context) ([]string, error)
+
+type SAMLConfig struct {
+	MetadataURL string `toml:"metadata_url"`
+	GroupsAttr  string `toml:"groups_attr"`
+	UsePost     bool   `toml:"use_post"`     // whether to use POST binding
+	ForceAuthn  bool   `toml:"force_authn"`  // whether to force authn
+	SPKeyFile   string `toml:"sp_key_file"`  // the SP key file to use
+	SPCertFile  string `toml:"sp_cert_file"` // the SP cert file to use
+}
+
+const (
+	SAML_SESSION_KV_PREFIX      = "saml_session:"
+	OAUTH_SESSION_KV_PREFIX     = "oauth_session:"
+	CONSTANT_KV_PREFIX          = "constant:"
+	COOKIE_SESSION_SECRET_KV    = "cookie_session_secret"
+	COOKIE_SESSION_BLOCK_KEY_KV = "cookie_session_block_key"
+)
+
+const (
+	// OpenRun headers are used to pass information to the downstream service
+	OPENRUN_HEADER_PREFIX           = "X-Openrun-"
+	OPENRUN_HEADER_USER             = OPENRUN_HEADER_PREFIX + "User"
+	OPENRUN_HEADER_PERMS            = OPENRUN_HEADER_PREFIX + "Perms"
+	OPENRUN_HEADER_APP_RBAC_ENABLED = OPENRUN_HEADER_PREFIX + "Rbac-Enabled"
+)

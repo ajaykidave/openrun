@@ -7,7 +7,7 @@ tests:
   container0010: # setup flask app
     command: rm -rf ./flaskapp && mkdir flaskapp && cp flask.py flaskapp/app.py
   container0020: # setup flask dev app
-    command: ../openrun app create --dev --spec python-flask --approve ./flaskapp /cont_flaskdev
+    command: ../openrun app create --dev --spec python-flask --approve --copt kubernetes.invalid=abc --copt docker.cpus=2 --copt command.memory=1g --copt hostname=flaskapp ./flaskapp /cont_flaskdev
   container0030: # setup flask prod app
     command: ../openrun app create --spec python-flask --carg PYTHON_VERSION='{{secret_from "env" "PYTHON_VERSION"}}' --copt cpu-shares=1000 --approve ./flaskapp /cont_flaskprod
   container0031: # invalid python version carg fails
@@ -16,7 +16,7 @@ tests:
     command: curl -sS localhost:${HTTP_PORT}/cont_flaskdev2
     stdout: 4invalid
   container0033: # invalid container run option fails
-    command: ../openrun app create --spec python-flask --container-option invalid=abc --approve ./flaskapp /cont_flaskdev3
+    command: ../openrun app create --spec python-flask --container-option command.invalid=abc --approve ./flaskapp /cont_flaskdev3
   container0034: # check curl
     command: curl -sS localhost:${HTTP_PORT}/cont_flaskdev3
     stdout: invalid

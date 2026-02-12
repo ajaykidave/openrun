@@ -20,6 +20,7 @@ import (
 	"github.com/openrundev/openrun/internal/app"
 	"github.com/openrundev/openrun/internal/app/appfs"
 	"github.com/openrundev/openrun/internal/metadata"
+	"github.com/openrundev/openrun/internal/rbac"
 	"github.com/openrundev/openrun/internal/system"
 	"github.com/openrundev/openrun/internal/types"
 	"github.com/segmentio/ksuid"
@@ -132,12 +133,12 @@ func (s *Server) CreateAppTx(ctx context.Context, currentTx types.Transaction, a
 	appEntry.SourceUrl = sourceUrl
 	appEntry.IsDev = appRequest.IsDev
 	if appRequest.AppAuthn != "" {
-		if !s.ssoAuth.ValidateAuthType(string(appRequest.AppAuthn)) {
-			return nil, fmt.Errorf("invalid authentication type %s", appRequest.AppAuthn)
+		if err := s.validateAppAuthnType(string(appRequest.AppAuthn)); err != nil {
+			return nil, err
 		}
-		appEntry.Settings.AuthnType = appRequest.AppAuthn
+		appEntry.Metadata.AuthnType = appRequest.AppAuthn
 	} else {
-		appEntry.Settings.AuthnType = types.AppAuthnDefault
+		appEntry.Metadata.AuthnType = types.AppAuthnDefault
 	}
 	// Set the default for write access by staging and preview apps
 	appEntry.Settings.StageWriteAccess = s.config.Security.StageEnableWriteAccess
@@ -161,6 +162,18 @@ func (s *Server) CreateAppTx(ctx context.Context, currentTx types.Transaction, a
 	}
 
 	return auditResult, nil
+}
+
+func (s *Server) validateAppAuthnType(authStr string) error {
+	if strings.HasPrefix(authStr, SAML_AUTH_PREFIX) || strings.HasPrefix(authStr, rbac.RBAC_AUTH_PREFIX+SAML_AUTH_PREFIX) {
+		// saml auth, with or without rbac
+		if !s.samlManager.ValidateSAMLProvider(authStr) {
+			return fmt.Errorf("invalid saml auth type %s", authStr)
+		}
+	} else if !s.oAuthManager.ValidateAuthType(authStr) {
+		return fmt.Errorf("invalid authentication type %s", authStr)
+	}
+	return nil
 }
 
 func (s *Server) createApp(ctx context.Context, tx types.Transaction,
@@ -355,7 +368,7 @@ func (s *Server) setupApp(appEntry *types.AppEntry, tx types.Transaction) (*app.
 		})
 	return app.NewApp(sourceFS, workFS, &appLogger, appEntry, &s.config.System,
 		s.config.Plugins, s.config.AppConfig, s.notifyClose, s.secretsManager.AppEvalTemplate,
-		s.InsertAuditEvent, s.config, s.AuthorizeAny)
+		s.InsertAuditEvent, s.config, s.rbacManager)
 }
 
 func (s *Server) GetAppApi(ctx context.Context, appPath string) (*types.AppGetResponse, error) {
@@ -384,7 +397,7 @@ func (s *Server) GetAppEntry(ctx context.Context, tx types.Transaction, pathDoma
 	return s.db.GetAppTx(ctx, tx, pathDomain)
 }
 
-func (s *Server) GetApp(pathDomain types.AppPathDomain, init bool) (*app.App, error) {
+func (s *Server) GetApp(ctx context.Context, pathDomain types.AppPathDomain, init bool) (*app.App, error) {
 	application, err := s.apps.GetApp(pathDomain)
 	if err != nil {
 		// App not found in cache, get from DB
@@ -405,7 +418,7 @@ func (s *Server) GetApp(pathDomain types.AppPathDomain, init bool) (*app.App, er
 	}
 
 	// Initialize the app
-	if err := application.Initialize(types.DryRunFalse); err != nil {
+	if err := application.Initialize(ctx, types.DryRunFalse); err != nil {
 		return nil, fmt.Errorf("error initializing app: %w", err)
 	}
 
@@ -455,7 +468,7 @@ func (s *Server) DeleteApps(ctx context.Context, appPathGlob string, dryRun bool
 
 func (s *Server) authenticateAndServeApp(w http.ResponseWriter, r *http.Request, app *app.App) {
 	var err error
-	appAuth := app.Settings.AuthnType
+	appAuth := app.Metadata.AuthnType
 	if appAuth == "" || appAuth == types.AppAuthnDefault {
 		appAuth = types.AppAuthnType(s.config.Security.AppDefaultAuthType)
 	}
@@ -467,7 +480,7 @@ func (s *Server) authenticateAndServeApp(w http.ResponseWriter, r *http.Request,
 	userId := ""
 
 	// Remove the RBAC_AUTH_PREFIX rbac: prefix
-	strippedAuthStr := strings.TrimPrefix(string(appAuth), RBAC_AUTH_PREFIX)
+	strippedAuthStr := strings.TrimPrefix(string(appAuth), rbac.RBAC_AUTH_PREFIX)
 	strippedAuth := types.AppAuthnType(strippedAuthStr)
 	groups := make([]string, 0)
 
@@ -495,15 +508,28 @@ func (s *Server) authenticateAndServeApp(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		userId = strippedAuthStr
+	} else if strings.HasPrefix(strippedAuthStr, SAML_AUTH_PREFIX) {
+		// Use SAML auth
+		if !s.samlManager.ValidateSAMLProvider(strippedAuthStr) {
+			http.Error(w, "Unsupported saml provider: "+strippedAuthStr, http.StatusInternalServerError)
+			return
+		}
+		userId, groups, err = s.samlManager.CheckSAMLAuth(w, r, strippedAuthStr)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		if userId == "" {
+			return // Already redirected to auth provider
+		}
 	} else {
 		// Use SSO auth
-		if !s.ssoAuth.ValidateProviderName(strippedAuthStr) {
+		if !s.oAuthManager.ValidateProviderName(strippedAuthStr) {
 			http.Error(w, "Unsupported authentication provider: "+strippedAuthStr, http.StatusInternalServerError)
 			return
 		}
 
 		// Redirect to the auth provider if not logged in
-		userId, groups, err = s.ssoAuth.CheckAuth(w, r, strippedAuthStr, true)
+		userId, groups, err = s.oAuthManager.CheckAuth(w, r, strippedAuthStr)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -513,7 +539,7 @@ func (s *Server) authenticateAndServeApp(w http.ResponseWriter, r *http.Request,
 	}
 
 	s.Trace().Msgf("Authenticated user %s, doing authorization check", userId)
-	authorized, err := s.rbacManager.Authorize(userId, app.AppPathDomain(), string(appAuth), types.PermissionAccess, groups, false)
+	authorized, err := s.rbacManager.AuthorizeInt(userId, app.AppPathDomain(), string(appAuth), types.PermissionAccess, groups, false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -541,7 +567,11 @@ func (s *Server) authenticateAndServeApp(w http.ResponseWriter, r *http.Request,
 	r = r.WithContext(ctx)
 
 	// Authentication successful, serve the app
-	app.ServeHTTP(w, r)
+	if !app.AppConfig.Security.DisableCSRFProtection {
+		s.csrfMiddleware.Handler(app).ServeHTTP(w, r)
+	} else {
+		app.ServeHTTP(w, r)
+	}
 }
 
 // verifyClientCerts verifies the client certificate, whether it is signed by one
@@ -697,12 +727,23 @@ func (s *Server) getStageApp(ctx context.Context, tx types.Transaction, appEntry
 	return stageAppEntry, nil
 }
 
-func parseGithubUrl(sourceUrl string, usingSSH bool) (repo, folder string, err error) {
+const REPO_FOLDER_SEPERATOR = "//"
+
+func parseGitUrl(sourceUrl string, usingSSH bool) (repo, folder string, err error) {
 	if !strings.HasSuffix(sourceUrl, "/") {
 		sourceUrl = sourceUrl + "/"
 	}
 
+	// GitLab supports groups and subgroups, like gitlab.com/g16004341/g2/pr1/app1
+	// OpenRun requires such urls to be specified with // separator for the folder path
+	// like gitlab.com/g16004341/g2/pr1//app1
+
 	if strings.HasPrefix(sourceUrl, "git@") {
+		if strings.Contains(sourceUrl, REPO_FOLDER_SEPERATOR) {
+			repo, folder, _ := strings.Cut(sourceUrl, REPO_FOLDER_SEPERATOR)
+			return repo, folder, nil
+		}
+
 		// Using git url format
 		split := strings.SplitN(sourceUrl, "/", 3)
 		if len(split) != 3 {
@@ -719,6 +760,17 @@ func parseGithubUrl(sourceUrl string, usingSSH bool) (repo, folder string, err e
 	url, err := url.Parse(sourceUrl)
 	if err != nil {
 		return "", "", err
+	}
+
+	if strings.Contains(url.Path, REPO_FOLDER_SEPERATOR) {
+		repo, folder, _ := strings.Cut(url.Path, REPO_FOLDER_SEPERATOR)
+		if usingSSH {
+			repo = strings.TrimPrefix(repo, "/")
+			// Use git url like git@github.com:openrundev/openrun.git
+			gitUrl := fmt.Sprintf("git@%s:%s.git", url.Host, repo)
+			return gitUrl, folder, nil
+		}
+		return fmt.Sprintf("%s://%s%s", url.Scheme, url.Host, repo), folder, nil
 	}
 
 	split := strings.SplitN(url.Path, "/", 4)
@@ -778,7 +830,7 @@ func (s *Server) loadGitKey(gitAuth string) (*gitAuthEntry, error) {
 }
 
 func (s *Server) loadSourceFromGit(ctx context.Context, tx types.Transaction, appEntry *types.AppEntry, branch, commit, gitAuth string, repoCache *RepoCache) error {
-	gitAuth = cmp.Or(gitAuth, appEntry.Settings.GitAuthName)
+	gitAuth = cmp.Or(gitAuth, appEntry.Metadata.GitAuthName)
 	branch = cmp.Or(branch, appEntry.Metadata.VersionMetadata.GitBranch, "main")
 
 	repo, folder, message, hash, err := repoCache.CheckoutRepo(appEntry.SourceUrl, branch, commit, gitAuth, appEntry.IsDev)
@@ -806,7 +858,7 @@ func (s *Server) loadSourceFromGit(ctx context.Context, tx types.Transaction, ap
 	} else {
 		appEntry.Metadata.VersionMetadata.GitBranch = branch
 	}
-	appEntry.Settings.GitAuthName = gitAuth
+	appEntry.Metadata.GitAuthName = gitAuth
 
 	s.Info().Msgf("Cloned git repo %s %s:%s folder %s to %s, commit %s: %s", repo,
 		appEntry.Metadata.VersionMetadata.GitBranch, appEntry.Metadata.VersionMetadata.GitCommit, folder, repo, hash, message)
@@ -842,7 +894,7 @@ func (s *Server) loadSourceFromDisk(ctx context.Context, tx types.Transaction, a
 	s.Info().Msgf("Loading app sources from %s", appEntry.SourceUrl)
 	appEntry.Metadata.VersionMetadata.GitBranch = ""
 	appEntry.Metadata.VersionMetadata.GitCommit = ""
-	appEntry.Settings.GitAuthName = ""
+	appEntry.Metadata.GitAuthName = ""
 	appEntry.Metadata.VersionMetadata.GitMessage = ""
 
 	fileStore, err := metadata.NewFileStore(appEntry.Id, appEntry.Metadata.VersionMetadata.Version, s.db, tx)
@@ -889,7 +941,7 @@ func (s *Server) FilterApps(appappPathGlob string, includeInternal bool) ([]type
 		mainApps = apps
 	}
 	// Filter based on path spec. This is done on the main apps path only.
-	filteredApps, err := ParseGlobFromInfo(appappPathGlob, mainApps)
+	filteredApps, err := rbac.ParseGlobFromInfo(appappPathGlob, mainApps)
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +983,7 @@ func (s *Server) GetApps(ctx context.Context, appPathGlob string, internal bool)
 		if !authorized {
 			continue
 		}
-		retApp, err := s.GetApp(app.AppPathDomain, false)
+		retApp, err := s.GetApp(ctx, app.AppPathDomain, false)
 		if err != nil {
 			return nil, types.CreateRequestError(err.Error(), http.StatusInternalServerError)
 		}
@@ -999,7 +1051,7 @@ func (s *Server) PreviewApp(ctx context.Context, mainAppPath, commitId string, a
 	}
 
 	// Checkout the git repo locally and load into database
-	if err := s.loadSourceFromGit(ctx, tx, &previewAppEntry, "", commitId, previewAppEntry.Settings.GitAuthName, repoCache); err != nil {
+	if err := s.loadSourceFromGit(ctx, tx, &previewAppEntry, "", commitId, previewAppEntry.Metadata.GitAuthName, repoCache); err != nil {
 		return nil, fmt.Errorf("failed to load source %s from git: %w", previewAppEntry.SourceUrl, err)
 	}
 
